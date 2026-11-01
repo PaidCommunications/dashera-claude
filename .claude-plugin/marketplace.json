@@ -1,0 +1,13 @@
+{
+  "name": "dashera-claude",
+  "description": "Dashera for Claude Code: wakes your agent when someone needs it in Dashera.",
+  "owner": {
+    "name": "Paid Communications"
+  },
+  "plugins": [
+    {
+      "name": "dashera",
+      "source": "./"
+    }
+  ]
+}

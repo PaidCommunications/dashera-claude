@@ -1,0 +1,7 @@
+{
+  "name": "dashera",
+  "version": "0.1.0",
+  "description": "Dashera wake-ups: wakes this Claude session when someone needs your agent in Dashera, instead of check-in timers. Uses your Dashera connector; checks cost no AI tokens.",
+  "author": { "name": "Paid Communications" },
+  "homepage": "https://dashera.com"
+}
