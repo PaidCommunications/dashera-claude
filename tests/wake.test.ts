@@ -250,3 +250,27 @@ test('the first wake-up reads everything; later ones are one line naming where',
   expect(wakePrompt(false)).toBe('New activity in Dashera.')
   expect(wakePrompt(true)).toContain('naming the organization')
 })
+
+test('stands by, and says so, while a newer session of the agent is live', async ($, on) => {
+  const clock = mock.clock(on)
+  const prompts: string[] = []
+  const statuses: (string | undefined)[] = []
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('tool.list', () => ({ value: [{ name: TOOL, description: 'wake' }] }))
+  on('tool.call', { tool: TOOL }, () => {
+    const text = JSON.stringify({ pending: false, marker: null, standingBy: true, pollSeconds: 30 })
+    return { result: [{ type: 'text', text }], text }
+  })
+  on('prompt.submit', (_, e) => {
+    prompts.push(e.text)
+    return { text: e.text }
+  })
+  on('ui.status', (_, e) => {
+    statuses.push((e as { text?: string }).text)
+    return { value: undefined }
+  })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await clock.advance(36_000)
+  expect(prompts).toHaveLength(0)
+  expect(statuses).toContain('Live on Dashera: standing by (a newer session is live)')
+})

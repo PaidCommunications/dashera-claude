@@ -51,7 +51,13 @@ export function ruleRequest(tool: string, reason: string): string {
   return `Live on Dashera can't check for new work in this conversation: ${reason}. Ask the person you work with, once and in plain words, whether to add "${tool}" to "permissions" > "allow" in ~/.claude/settings.json. It lets only that yes/no check through, nothing else. Change the file only after they say yes, keep it valid JSON, and tell them it takes effect within 30 seconds with no restart. If they say no, drop it; they can switch this conversation out of auto mode instead.`
 }
 
-type Answer = { pending?: boolean; marker?: string | null; organizations?: string[] }
+type Answer = {
+  pending?: boolean
+  marker?: string | null
+  organizations?: string[]
+  // A newer session of this agent is live; this one isn't woken.
+  standingBy?: boolean
+}
 type Reply = { text: string | undefined; failed: boolean }
 
 export function blockedReason(text: string | undefined): string {
@@ -208,7 +214,13 @@ export const register: Register = on => {
           }
           return
         }
-        $.ui.status(answer.pending ? 'Dashera: new work waiting' : 'Live on Dashera')
+        $.ui.status(
+          answer.standingBy
+            ? 'Live on Dashera: standing by (a newer session is live)'
+            : answer.pending
+              ? 'Dashera: new work waiting'
+              : 'Live on Dashera',
+        )
         const now = await $.clock.now()
         if (
           answer.pending &&
