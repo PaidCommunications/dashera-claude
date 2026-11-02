@@ -29,6 +29,11 @@ export function wakeTools<T extends { name: string; description: string }>(
   return tools.filter(t => isWakeTool(t.name)).sort((a, b) => rank(a) - rank(b))
 }
 
+/** The one turn that asks the person for the rule; nothing changes without their yes. */
+export function ruleRequest(tool: string, reason: string): string {
+  return `Live on Dashera can't check for new work in this conversation: ${reason}. Ask the person you work with, once and in plain words, whether to add "${tool}" to "permissions" > "allow" in ~/.claude/settings.json. It lets only that yes/no check through, nothing else. Change the file only after they say yes, keep it valid JSON, and tell them it takes effect within 30 seconds with no restart. If they say no, drop it; they can switch this conversation out of auto mode instead.`
+}
+
 type Answer = { pending?: boolean; marker?: string | null }
 type Reply = { text: string | undefined; failed: boolean }
 
@@ -57,6 +62,7 @@ export const register: Register = on => {
   let lastWakeAt = Number.NEGATIVE_INFINITY
   let polling = false
   let lastGood: string | undefined
+  let askedForRule = false
 
   // Only this plugin's own yes/no question goes through without a dialog;
   // the model's calls and every other tool are decided as before.
@@ -172,9 +178,16 @@ export const register: Register = on => {
         }
         if (!answer) {
           // Say why, and what to allow, instead of going quiet.
-          $.ui.status(
-            `Live on Dashera: paused (${blockedReason(refused?.text)}; allow ${found[0]!.name})`,
-          )
+          const reason = blockedReason(refused?.text)
+          $.ui.status(`Live on Dashera: paused (${reason}; allow ${found[0]!.name})`)
+          // Once per session, when a permission setting is what blocks it,
+          // have the agent ask its person for the one-tool rule, so they
+          // only say yes (2 Nov 2026: "one-click Live on Dashera").
+          if (!askedForRule && reason !== 'the connector refused the check') {
+            askedForRule = true
+            // A refused or failed submit just means no reminder this time.
+            void $.prompt.submit({ text: ruleRequest(found[0]!.name, reason) }).catch(() => {})
+          }
           return
         }
         $.ui.status(answer.pending ? 'Dashera: new work waiting' : 'Live on Dashera')
@@ -188,7 +201,7 @@ export const register: Register = on => {
           lastMarker = answer.marker
           lastWakeAt = now
           // Queued: it starts its own turn once the session is idle.
-          void $.prompt.submit({ text: PROMPT })
+          void $.prompt.submit({ text: PROMPT }).catch(() => {})
         }
       } catch {
         // The connector may be reconnecting; the next tick tries again.

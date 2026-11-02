@@ -192,3 +192,49 @@ test('with two Dashera connectors, uses the one a permission rule allows', async
   await clock.advance(30_000)
   expect(asked[0]).toBe('dashera')
 })
+
+test('asks once, through the agent, for the one-tool rule when auto mode blocks the check', async ($, on) => {
+  const clock = mock.clock(on)
+  const ID_TOOL = 'mcp__618e79f2-adbe-49a0-a83c-37cbf0b55c46__wake_status'
+  const prompts: string[] = []
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('ui.status', () => ({ value: undefined }))
+  on('tool.list', () => ({
+    value: [{ name: ID_TOOL, description: 'is anything new addressed to you in Dashera' }],
+  }))
+  on('mcp.call', () => {
+    throw new Error('The server-side auto mode classifier gave no verdict')
+  })
+  on('tool.call', { tool: ID_TOOL }, () => {
+    const text = 'Error: The server-side auto mode classifier gave no verdict'
+    return { result: text, text }
+  })
+  on('prompt.submit', (_, e) => {
+    prompts.push(e.text)
+    return { text: e.text }
+  })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await clock.advance(6_000 + 3 * 30_000)
+  expect(prompts).toHaveLength(1)
+  expect(prompts[0]).toContain(ID_TOOL)
+  expect(prompts[0]).toContain('only after they say yes')
+})
+
+test("doesn't ask for a rule when the connector itself refuses", async ($, on) => {
+  const clock = mock.clock(on)
+  const prompts: string[] = []
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('ui.status', () => ({ value: undefined }))
+  on('tool.list', () => ({ value: [{ name: TOOL, description: 'Dashera wake' }] }))
+  on('mcp.call', () => ({
+    value: { content: [{ type: 'text', text: 'Unauthorized' }], isError: true },
+  }))
+  on('tool.call', { tool: TOOL }, () => ({ isError: true, result: 'Unauthorized', text: 'Unauthorized' }))
+  on('prompt.submit', (_, e) => {
+    prompts.push(e.text)
+    return { text: e.text }
+  })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await clock.advance(6_000 + 30_000)
+  expect(prompts).toHaveLength(0)
+})
