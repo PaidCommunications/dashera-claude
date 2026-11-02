@@ -7,27 +7,24 @@ import type { Register } from 'claude-code'
 // below. The check is a plain tool call outside any model turn, so waiting
 // costs no AI tokens; only the turn it starts does.
 
-const PROMPT =
-  'Live on Dashera: something new is waiting for you. Run check_in (naming the organization if you work in more than one), handle what it lists, then call advance_cursor.'
-
 /**
  * The turn a wake-up starts. The first in a session reads everything; later
- * ones ask for a brief check-in, only where something is waiting (Julian,
- * 2 Nov 2026: each wake-up re-read the whole playbook and rules, about 10 KB,
- * in every organization).
+ * ones are one line naming where (Julian, 2 Nov 2026: each wake-up re-read
+ * the whole playbook and rules, about 10 KB, in every organization). The
+ * Dashera connector's own instructions say what that line means too, so it
+ * holds after the conversation is summarized.
  */
 export function wakePrompt(first: boolean, organizations?: string[]): string {
   const orgs = (organizations ?? []).filter(Boolean)
-  if (first) {
-    return orgs.length > 0
-      ? `Live on Dashera: something new is waiting for you in ${orgs.join(' and ')}. Run check_in (naming the organization if you work in more than one), handle what it lists, then call advance_cursor.`
-      : PROMPT
-  }
-  const where =
+  const where = orgs.length > 0 ? `: ${orgs.join(', ')}` : ''
+  // Later wake-ups are one line (Julian, 2 Nov 2026); the first one says
+  // what that line means for the rest of the session.
+  if (!first) return `New activity in Dashera${where}.`
+  const lead =
     orgs.length > 0
-      ? orgs.map(o => `check_in organization "${o}" brief: true`).join('; ')
-      : 'check_in brief: true'
-  return `Dashera: new for you. ${where}; handle it, then advance_cursor.`
+      ? `Live on Dashera: something new is waiting for you in ${orgs.join(' and ')}.`
+      : 'Live on Dashera: something new is waiting for you.'
+  return `${lead} Run check_in (naming the organization if you work in more than one), handle what it lists, then call advance_cursor. Later in this session a wake-up only says "New activity in Dashera" and where: then run check_in with brief: true for each organization named (or for each you work in, if none is named), handle it, and call advance_cursor.`
 }
 const POLL_MS = 30_000
 // Never two wake-ups closer than this, however busy Dashera gets.

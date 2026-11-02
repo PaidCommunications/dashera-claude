@@ -240,15 +240,13 @@ test("doesn't ask for a rule when the connector itself refuses", async ($, on) =
   expect(prompts).toHaveLength(0)
 })
 
-test('the first wake-up reads everything; later ones check in briefly, only where news is', () => {
+test('the first wake-up reads everything; later ones are one line naming where', () => {
   const first = wakePrompt(true, ['Humboldt Gardens'])
   expect(first).toContain('Humboldt Gardens')
-  expect(first).not.toContain('brief')
-  const later = wakePrompt(false, ['Humboldt Gardens'])
-  expect(later).toContain('organization "Humboldt Gardens" brief: true')
-  expect(later).not.toContain('Paid Communications')
-  expect(later.length).toBeLessThan(first.length)
-  // An older Dashera that doesn't say where: brief, without an organization.
-  expect(wakePrompt(false)).toContain('check_in brief: true')
+  expect(first).toContain('brief: true')
+  expect(first).toContain('New activity in Dashera')
+  expect(wakePrompt(false, ['Humboldt Gardens'])).toBe('New activity in Dashera: Humboldt Gardens.')
+  // An older Dashera that doesn't say where.
+  expect(wakePrompt(false)).toBe('New activity in Dashera.')
   expect(wakePrompt(true)).toContain('naming the organization')
 })
