@@ -14,17 +14,27 @@ import type { Register } from 'claude-code'
  * Dashera connector's own instructions say what that line means too, so it
  * holds after the conversation is summarized.
  */
-export function wakePrompt(first: boolean, organizations?: string[]): string {
+export function wakePrompt(
+  first: boolean,
+  organizations?: string[],
+  session?: string | null,
+): string {
   const orgs = (organizations ?? []).filter(Boolean)
   const where = orgs.length > 0 ? `: ${orgs.join(', ')}` : ''
+  // Several live sessions each get their own items (2 Nov 2026): the code
+  // tells Dashera which one is asking.
+  const code = session ? ` (session ${session})` : ''
   // Later wake-ups are one line (Julian, 2 Nov 2026); the first one says
   // what that line means for the rest of the session.
-  if (!first) return `New activity in Dashera${where}.`
+  if (!first) return `New activity in Dashera${where}${code}.`
   const lead =
     orgs.length > 0
       ? `Live on Dashera: something new is waiting for you in ${orgs.join(' and ')}.`
       : 'Live on Dashera: something new is waiting for you.'
-  return `${lead} Run check_in (naming the organization if you work in more than one), handle what it lists, then call advance_cursor. Later in this session a wake-up only says "New activity in Dashera" and where: then run check_in with brief: true for each organization named (or for each you work in, if none is named), handle it, and call advance_cursor.`
+  const pass = session
+    ? ` This session's code is ${session}: pass session: "${session}" to check_in, advance_cursor and name_my_session, so it reads and marks only its own items.`
+    : ''
+  return `${lead} Run check_in (naming the organization if you work in more than one), handle what it lists, then call advance_cursor.${pass} Later in this session a wake-up only says "New activity in Dashera" and where: then run check_in with brief: true for each organization named (or for each you work in, if none is named), handle it, and call advance_cursor.`
 }
 const POLL_MS = 30_000
 // Never two wake-ups closer than this, however busy Dashera gets.
@@ -57,6 +67,8 @@ type Answer = {
   organizations?: string[]
   // A newer session of this agent is live; this one isn't woken.
   standingBy?: boolean
+  // This session's code and name, for the agent to pass as session.
+  session?: { code: string; name: string | null }
 }
 type Reply = { text: string | undefined; failed: boolean }
 
@@ -214,12 +226,14 @@ export const register: Register = on => {
           }
           return
         }
+        // Older Dashera (one live session) may still say standingBy.
+        const label = answer.session?.code ? ` · ${answer.session.code}` : ''
         $.ui.status(
           answer.standingBy
             ? 'Live on Dashera: standing by (a newer session is live)'
             : answer.pending
-              ? 'Dashera: new work waiting'
-              : 'Live on Dashera',
+              ? `Dashera: new work waiting${label}`
+              : `Live on Dashera${label}`,
         )
         const now = await $.clock.now()
         if (
@@ -231,7 +245,7 @@ export const register: Register = on => {
           lastMarker = answer.marker
           lastWakeAt = now
           // Queued: it starts its own turn once the session is idle.
-          const text = wakePrompt(!woken, answer.organizations)
+          const text = wakePrompt(!woken, answer.organizations, answer.session?.code)
           woken = true
           void $.prompt.submit({ text }).catch(() => {})
         }

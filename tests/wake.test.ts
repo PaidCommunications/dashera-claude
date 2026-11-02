@@ -274,3 +274,13 @@ test('stands by, and says so, while a newer session of the agent is live', async
   expect(prompts).toHaveLength(0)
   expect(statuses).toContain('Live on Dashera: standing by (a newer session is live)')
 })
+
+test('names its session code in wake-ups, so several live sessions each take their own', () => {
+  const first = wakePrompt(true, ['Humboldt Gardens'], 'S-3F9A2C')
+  expect(first).toContain('session: "S-3F9A2C"')
+  expect(wakePrompt(false, ['Humboldt Gardens'], 'S-3F9A2C')).toBe(
+    'New activity in Dashera: Humboldt Gardens (session S-3F9A2C).',
+  )
+  // An older Dashera that gives no code: as before.
+  expect(wakePrompt(false, ['Humboldt Gardens'])).toBe('New activity in Dashera: Humboldt Gardens.')
+})
