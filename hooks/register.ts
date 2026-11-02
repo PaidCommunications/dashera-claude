@@ -13,8 +13,17 @@ const POLL_MS = 30_000
 // Never two wake-ups closer than this, however busy Dashera gets.
 const MIN_GAP_MS = 2 * 60_000
 
-const isWakeTool = (name: string) =>
-  /dashera/i.test(name) && /(^|__)wake_status$/.test(name)
+// Connectors added from claude.ai are named by an id
+// (mcp__618e79f2-...__wake_status), so the tool is found by its own name,
+// and among several by the one whose description says Dashera.
+const isWakeTool = (name: string) => /(^|__)wake_status$/.test(name)
+
+function pickWakeTool<T extends { name: string; description: string }>(
+  tools: readonly T[],
+): T | undefined {
+  const all = tools.filter(t => isWakeTool(t.name))
+  return all.find(t => /dashera/i.test(t.description + t.name)) ?? all[0]
+}
 
 type Answer = { pending?: boolean; marker?: string | null }
 
@@ -54,11 +63,11 @@ export const register: Register = on => {
       polling = true
       try {
         const tools = await $.tool.list()
-        const tool = tools.find(t => isWakeTool(t.name))
+        const tool = pickWakeTool(tools)
         if (!tool) {
-          // Connected to a Dashera that predates wake-ups, or not at all.
+          // Connected to a Dashera that predates it, or not at all.
           $.ui.status(
-            tools.some(t => /dashera/i.test(t.name))
+            tools.some(t => /dashera/i.test(t.name + t.description) && /__whoami$/.test(t.name))
               ? 'Live on Dashera: waiting for Dashera to offer it'
               : 'Live on Dashera: add the Dashera connector to turn it on',
           )
