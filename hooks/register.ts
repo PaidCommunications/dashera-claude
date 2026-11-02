@@ -59,14 +59,10 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const started = await next(e)
     // Where this session runs, for the agent's card in Dashera: the
-    // computer, the app and the folder. Never content. Each check sends it,
-    // so an agent open in two places answers each new item once.
+    // computer, the app and the folder. Never content. Gathered in the
+    // background with a time limit each, so nothing here can ever hold up
+    // the checks (a host command can wait on the app indefinitely).
     const where: Record<string, string> = {}
-    try {
-      where.sessionId = await $.session.id()
-    } catch {
-      // No id: Dashera treats the check as from an unnamed session.
-    }
     const surface = (e as { surface?: string }).surface
     where.app =
       surface === 'desktop'
@@ -76,26 +72,31 @@ export const register: Register = on => {
           : surface === 'mobile'
             ? 'Claude mobile'
             : 'terminal'
-    try {
-      const cwd = await $.session.cwd()
-      where.folder = cwd.split('/').filter(Boolean).pop() ?? cwd
-    } catch {
-      // The folder is a nicety.
-    }
-    for (const argv of [
-      ['scutil', '--get', 'ComputerName'],
-      ['hostname', '-s'],
-    ]) {
-      try {
-        const r = await $.process.run(argv, { timeoutMs: 2000 })
-        if (r.exitCode === 0 && r.stdout.trim()) {
+    const within = <T,>(p: Promise<T>, ms: number): Promise<T | undefined> =>
+      Promise.race([
+        p.catch(() => undefined),
+        new Promise<undefined>(r => {
+          $.clock.after(ms, () => r(undefined))
+        }),
+      ])
+    const gather = async () => {
+      const id = await within($.session.id(), 3000)
+      if (id) where.sessionId = id
+      const cwd = await within($.session.cwd(), 3000)
+      if (cwd) where.folder = cwd.split('/').filter(Boolean).pop() ?? cwd
+      for (const argv of [
+        ['scutil', '--get', 'ComputerName'],
+        ['hostname', '-s'],
+      ]) {
+        const r = await within($.process.run(argv, { timeoutMs: 2000 }), 3000)
+        if (r && r.exitCode === 0 && r.stdout.trim()) {
           where.machine = r.stdout.trim().slice(0, 80)
           break
         }
-      } catch {
-        // Not every host lets a plugin run a command: the card shows the app.
       }
     }
+    // On the plugin's own timer, after the start-up step has finished.
+    $.clock.after(1000, () => void gather())
     let sendWhere = true
     const tick = async () => {
       if (polling) return
