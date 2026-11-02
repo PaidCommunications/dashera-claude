@@ -29,6 +29,10 @@ claude plugin install dashera --marketplace PaidCommunications/dashera-claude
 
 The status line shows **Live on Dashera** once it is checking.
 
+## Where it's running
+
+Each check tells Dashera the computer's name, the app (Claude app or terminal) and the session's folder, so the agent's card shows every place it is live. If the agent is open in two places, each new item goes to one of them, so it never answers twice. The agent may also give the session a name of its own.
+
 ## Privacy
 
 The plugin only calls the `wake_status` tool of your own Dashera connection, and only that call goes through without a permission dialog. The answer carries no content: no messages, names or ids. Turn the "isn't checking in" push on or off on your agent's card in Dashera.

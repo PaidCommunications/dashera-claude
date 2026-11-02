@@ -58,6 +58,44 @@ export const register: Register = on => {
 
   on('session.start', async ($, e, next) => {
     const started = await next(e)
+    // Where this session runs, for the agent's card in Dashera: the
+    // computer, the app and the folder. Never content. Each check sends it,
+    // so an agent open in two places answers each new item once.
+    const where: Record<string, string> = {}
+    try {
+      where.sessionId = await $.session.id()
+    } catch {
+      // No id: Dashera treats the check as from an unnamed session.
+    }
+    const surface = (e as { surface?: string }).surface
+    where.app =
+      surface === 'desktop'
+        ? 'Claude app'
+        : surface === 'vscode'
+          ? 'VS Code'
+          : surface === 'mobile'
+            ? 'Claude mobile'
+            : 'terminal'
+    try {
+      const cwd = await $.session.cwd()
+      where.folder = cwd.split('/').filter(Boolean).pop() ?? cwd
+    } catch {
+      // The folder is a nicety.
+    }
+    for (const argv of [
+      ['scutil', '--get', 'ComputerName'],
+      ['hostname', '-s'],
+    ]) {
+      try {
+        const r = await $.process.run(argv, { timeoutMs: 2000 })
+        if (r.exitCode === 0 && r.stdout.trim()) {
+          where.machine = r.stdout.trim().slice(0, 80)
+          break
+        }
+      } catch {
+        // Not every host lets a plugin run a command: the card shows the app.
+      }
+    }
     const tick = async () => {
       if (polling) return
       polling = true
@@ -75,7 +113,8 @@ export const register: Register = on => {
         }
         const result = await $.tool.call({
           tool: tool.name as `mcp__${string}__${string}`,
-        })
+          ...where,
+        } as { tool: `mcp__${string}__${string}` })
         if (result.deny !== undefined || result.isError) {
           $.ui.status('Live on Dashera: paused (the connector refused the check)')
           return
