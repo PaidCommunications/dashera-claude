@@ -96,6 +96,7 @@ export const register: Register = on => {
         // Not every host lets a plugin run a command: the card shows the app.
       }
     }
+    let sendWhere = true
     const tick = async () => {
       if (polling) return
       polling = true
@@ -111,10 +112,18 @@ export const register: Register = on => {
           )
           return
         }
-        const result = await $.tool.call({
-          tool: tool.name as `mcp__${string}__${string}`,
-          ...where,
-        } as { tool: `mcp__${string}__${string}` })
+        const call = (extra: Record<string, string>) =>
+          $.tool.call({
+            tool: tool.name as `mcp__${string}__${string}`,
+            ...extra,
+          } as { tool: `mcp__${string}__${string}` })
+        let result = await call(sendWhere ? where : {})
+        // A session whose connector loaded its tool list before Dashera took
+        // session details refuses the extra fields: ask plainly from now on.
+        if (sendWhere && (result.deny !== undefined || result.isError)) {
+          sendWhere = false
+          result = await call({})
+        }
         if (result.deny !== undefined || result.isError) {
           $.ui.status('Live on Dashera: paused (the connector refused the check)')
           return

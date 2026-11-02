@@ -78,3 +78,28 @@ test('finds Dashera under a connector named by an id', async ($, on) => {
   await clock.advance(6_000)
   expect(prompts).toHaveLength(1)
 })
+
+test('still checks when an older connector refuses the session details', async ($, on) => {
+  const clock = mock.clock(on)
+  const TOOL2 = 'mcp__abc__wake_status'
+  const calls: Record<string, unknown>[] = []
+  const prompts: string[] = []
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('ui.status', () => ({ value: undefined }))
+  on('tool.list', () => ({
+    value: [{ name: TOOL2, description: 'is anything new addressed to you in Dashera' }],
+  }))
+  on('tool.call', { tool: TOOL2 }, (_, e) => {
+    calls.push({ ...e })
+    if ('sessionId' in e) return { isError: true, result: 'unknown field', text: 'unknown field' }
+    const text = JSON.stringify({ pending: true, marker: 'z', pollSeconds: 30 })
+    return { result: [{ type: 'text', text }], text }
+  })
+  on('prompt.submit', (_, e) => {
+    prompts.push(e.text)
+    return { text: e.text }
+  })
+  await $.session.start({ cwd: '/x/proj', surface: 'desktop', isInteractive: true })
+  await clock.advance(6_000)
+  expect(prompts).toHaveLength(1)
+})
