@@ -1,6 +1,6 @@
 import type { Register } from 'claude-code'
 
-// Dashera wake-ups (1 Nov 2026). Every 45 seconds, between turns, ask the
+// Dashera wake-ups (1 Nov 2026). Every 30 seconds, between turns, ask the
 // Dashera connector's wake_status tool "is anything new waiting for me?".
 // It answers yes/no and an opaque marker, nothing else. When the answer is
 // yes with a marker not seen before, start one turn with the fixed prompt
@@ -9,7 +9,7 @@ import type { Register } from 'claude-code'
 
 const PROMPT =
   'Dashera wake-up: something new is waiting for you. Run check_in (naming the organization if you work in more than one), handle what it lists, then call advance_cursor.'
-const POLL_MS = 45_000
+const POLL_MS = 30_000
 // Never two wake-ups closer than this, however busy Dashera gets.
 const MIN_GAP_MS = 2 * 60_000
 

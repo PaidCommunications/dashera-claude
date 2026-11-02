@@ -26,17 +26,17 @@ test('wakes once per new marker, never more often than every two minutes', async
   expect(prompts).toHaveLength(0)
 
   answer = { pending: true, marker: 'a1' }
-  await clock.advance(45_000)
+  await clock.advance(30_000)
   expect(prompts).toHaveLength(1)
   expect(prompts[0]).toContain('check_in')
 
   // The same marker never wakes it again.
-  await clock.advance(5 * 45_000)
+  await clock.advance(5 * 30_000)
   expect(prompts).toHaveLength(1)
 
   // A new marker does, once two minutes have passed since the last wake.
   answer = { pending: true, marker: 'b2' }
-  await clock.advance(45_000)
+  await clock.advance(30_000)
   expect(prompts).toHaveLength(2)
 })
 
