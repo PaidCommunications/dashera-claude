@@ -241,11 +241,11 @@ test("doesn't ask for a rule when the connector itself refuses", async ($, on) =
 })
 
 test('the first wake-up reads everything; later ones are one line naming where', () => {
-  const first = wakePrompt(true, ['Humboldt Gardens'])
-  expect(first).toContain('Humboldt Gardens')
+  const first = wakePrompt(true, ['Example Org'])
+  expect(first).toContain('Example Org')
   expect(first).toContain('brief: true')
   expect(first).toContain('New activity in Dashera')
-  expect(wakePrompt(false, ['Humboldt Gardens'])).toBe('New activity in Dashera: Humboldt Gardens.')
+  expect(wakePrompt(false, ['Example Org'])).toBe('New activity in Dashera: Example Org.')
   // An older Dashera that doesn't say where.
   expect(wakePrompt(false)).toBe('New activity in Dashera.')
   expect(wakePrompt(true)).toContain('naming the organization')
@@ -276,13 +276,13 @@ test('stands by, and says so, while a newer session of the agent is live', async
 })
 
 test('names its session code in wake-ups, so several live sessions each take their own', () => {
-  const first = wakePrompt(true, ['Humboldt Gardens'], 'S-3F9A2C')
+  const first = wakePrompt(true, ['Example Org'], 'S-3F9A2C')
   expect(first).toContain('session: "S-3F9A2C"')
-  expect(wakePrompt(false, ['Humboldt Gardens'], 'S-3F9A2C')).toBe(
-    'New activity in Dashera: Humboldt Gardens (session S-3F9A2C).',
+  expect(wakePrompt(false, ['Example Org'], 'S-3F9A2C')).toBe(
+    'New activity in Dashera: Example Org (session S-3F9A2C).',
   )
   // An older Dashera that gives no code: as before.
-  expect(wakePrompt(false, ['Humboldt Gardens'])).toBe('New activity in Dashera: Humboldt Gardens.')
+  expect(wakePrompt(false, ['Example Org'])).toBe('New activity in Dashera: Example Org.')
 })
 
 async function liveWithCode($: Parameters<Parameters<typeof test>[1]>[0], on: Parameters<Parameters<typeof test>[1]>[1]) {
@@ -310,7 +310,7 @@ test("fills in this session's code on check_in, so the agent needn't pass it", a
     return { result: [{ type: 'text', text: '{}' }], text: '{}' }
   })
   await liveWithCode($, on)
-  await $.tool.call({ tool: 'mcp__dashera__check_in', organization: 'Humboldt Gardens' } as never)
+  await $.tool.call({ tool: 'mcp__dashera__check_in', organization: 'Example Org' } as never)
   expect(seen).toHaveLength(1)
   expect(seen[0]!.session).toBe('S-7A479F')
   // A code the agent passed itself stands.
@@ -330,7 +330,7 @@ test('sends the call as written when an old tool list refuses the code', async (
     return { result: [{ type: 'text', text: '{"ok":true}' }], text: '{"ok":true}' }
   })
   await liveWithCode($, on)
-  const r = await $.tool.call({ tool: 'mcp__dashera__check_in', organization: 'Humboldt Gardens' } as never)
+  const r = await $.tool.call({ tool: 'mcp__dashera__check_in', organization: 'Example Org' } as never)
   expect(seen).toHaveLength(2)
   expect(seen[1]!.session).toBeUndefined()
   expect((r as { text?: string }).text).toBe('{"ok":true}')
