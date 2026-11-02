@@ -18,11 +18,15 @@ const MIN_GAP_MS = 2 * 60_000
 // and among several by the one whose description says Dashera.
 const isWakeTool = (name: string) => /(^|__)wake_status$/.test(name)
 
-function pickWakeTool<T extends { name: string; description: string }>(
+// Every Dashera wake tool, the one that last answered first, then those that
+// say Dashera, then any other.
+export function wakeTools<T extends { name: string; description: string }>(
   tools: readonly T[],
-): T | undefined {
-  const all = tools.filter(t => isWakeTool(t.name))
-  return all.find(t => /dashera/i.test(t.description + t.name)) ?? all[0]
+  lastGood?: string,
+): T[] {
+  const rank = (t: T) =>
+    t.name === lastGood ? 0 : /dashera/i.test(t.description + t.name) ? 1 : 2
+  return tools.filter(t => isWakeTool(t.name)).sort((a, b) => rank(a) - rank(b))
 }
 
 type Answer = { pending?: boolean; marker?: string | null }
@@ -52,6 +56,7 @@ export const register: Register = on => {
   let lastMarker: string | null = null
   let lastWakeAt = Number.NEGATIVE_INFINITY
   let polling = false
+  let lastGood: string | undefined
 
   // Only this plugin's own yes/no question goes through without a dialog;
   // the model's calls and every other tool are decided as before.
@@ -80,7 +85,7 @@ export const register: Register = on => {
           ? 'VS Code'
           : surface === 'mobile'
             ? 'Claude mobile'
-            : 'terminal'
+            : 'Claude Code'
     const within = <T,>(p: Promise<T>, ms: number): Promise<T | undefined> =>
       Promise.race([
         p.catch(() => undefined),
@@ -112,8 +117,8 @@ export const register: Register = on => {
       polling = true
       try {
         const tools = await $.tool.list()
-        const tool = pickWakeTool(tools)
-        if (!tool) {
+        const found = wakeTools(tools, lastGood)
+        if (found.length === 0) {
           // Connected to a Dashera that predates it, or not at all.
           $.ui.status(
             tools.some(t => /dashera/i.test(t.name + t.description) && /__whoami$/.test(t.name))
@@ -122,38 +127,54 @@ export const register: Register = on => {
           )
           return
         }
-        // The connector is called directly ($.mcp.call): the plugin's own call
-        // is the grant, so it works in every permission mode. Auto mode
-        // refuses $.tool.call here, as no message of the user's asked for it
-        // (found by the HG agent, 2 Nov). $.tool.call stays as a fallback.
-        const server = tool.name.replace(/^mcp__/, '').replace(/__wake_status$/, '')
-        const ask = async (extra: Record<string, string>): Promise<Reply> => {
+        // In auto mode a check no message of the user's asked for is refused,
+        // by $.tool.call and $.mcp.call alike, unless a permission allow rule
+        // covers the tool (found by the HG agent, 2 Nov). With two Dashera
+        // connectors only one may be allowed, so try each, the last one that
+        // answered first.
+        const ask = async (name: string, extra: Record<string, string>): Promise<Reply> => {
+          const server = name.replace(/^mcp__/, '').replace(/__wake_status$/, '')
           try {
             const r = await $.mcp.call(server, 'wake_status', extra)
             const text = r.content
               .map(b => ((b as { type?: string }).type === 'text' ? (b as { text: string }).text : ''))
               .join('\n')
             return { text: text || JSON.stringify(r.structuredContent ?? null), failed: r.isError }
-          } catch {
-            const r = await $.tool.call({
-              tool: tool.name as `mcp__${string}__${string}`,
-              ...extra,
-            } as { tool: `mcp__${string}__${string}` })
-            const text = r.text ?? JSON.stringify(r.result ?? null)
-            return { text, failed: r.deny !== undefined || !!r.isError }
+          } catch (err) {
+            try {
+              const r = await $.tool.call({
+                tool: name as `mcp__${string}__${string}`,
+                ...extra,
+              } as { tool: `mcp__${string}__${string}` })
+              const text = r.text ?? JSON.stringify(r.result ?? null)
+              return { text, failed: r.deny !== undefined || !!r.isError }
+            } catch {
+              return { text: String(err), failed: true }
+            }
           }
         }
-        let reply = await ask(sendWhere ? where : {})
-        // A session whose connector loaded its tool list before Dashera took
-        // session details refuses the extra fields: ask plainly from now on.
-        if (sendWhere && (reply.failed || !parse(reply.text))) {
-          sendWhere = false
-          reply = await ask({})
+        let answer: Answer | null = null
+        let refused: Reply | undefined
+        for (const t of found) {
+          let reply = await ask(t.name, sendWhere ? where : {})
+          // A session whose connector loaded its tool list before Dashera took
+          // session details refuses the extra fields: ask plainly from now on.
+          if (sendWhere && (reply.failed || !parse(reply.text))) {
+            reply = await ask(t.name, {})
+            if (!reply.failed && parse(reply.text)) sendWhere = false
+          }
+          answer = reply.failed ? null : parse(reply.text)
+          if (answer) {
+            lastGood = t.name
+            break
+          }
+          refused ??= reply
         }
-        const answer = reply.failed ? null : parse(reply.text)
         if (!answer) {
-          // Say why instead of going quiet.
-          $.ui.status(`Live on Dashera: paused (${blockedReason(reply.text)})`)
+          // Say why, and what to allow, instead of going quiet.
+          $.ui.status(
+            `Live on Dashera: paused (${blockedReason(refused?.text)}; allow ${found[0]!.name})`,
+          )
           return
         }
         $.ui.status(answer.pending ? 'Dashera: new work waiting' : 'Live on Dashera')

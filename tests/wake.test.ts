@@ -104,7 +104,7 @@ test('still checks when an older connector refuses the session details', async (
   expect(prompts).toHaveLength(1)
 })
 
-test('asks the connector directly, so auto mode cannot refuse the check', async ($, on) => {
+test('asks the connector directly first', async ($, on) => {
   const clock = mock.clock(on)
   const ID_TOOL = 'mcp__618e79f2-adbe-49a0-a83c-37cbf0b55c46__wake_status'
   const servers: string[] = []
@@ -152,5 +152,43 @@ test('says the check is paused, and why, instead of going quiet', async ($, on) 
   })
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
   await clock.advance(6_000)
-  expect(statuses).toContain('Live on Dashera: paused (auto mode refused the check)')
+  expect(statuses.some(s => s?.startsWith('Live on Dashera: paused (auto mode refused the check; allow '))).toBe(true)
+})
+
+test('with two Dashera connectors, uses the one a permission rule allows', async ($, on) => {
+  const clock = mock.clock(on)
+  const REFUSED = 'mcp__618e79f2-adbe-49a0-a83c-37cbf0b55c46__wake_status'
+  const ALLOWED = 'mcp__dashera__wake_status'
+  const prompts: string[] = []
+  const asked: string[] = []
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('ui.status', () => ({ value: undefined }))
+  // The refused one is listed first, as after a connector reconnects.
+  on('tool.list', () => ({
+    value: [
+      { name: REFUSED, description: 'Yes or no: is anything new in Dashera' },
+      { name: ALLOWED, description: 'Yes or no: is anything new in Dashera' },
+    ],
+  }))
+  on('mcp.call', (_, e) => {
+    asked.push(e.server)
+    if (e.server !== 'dashera') throw new Error('auto mode classifier gave no verdict')
+    const text = JSON.stringify({ pending: true, marker: 'two', pollSeconds: 30 })
+    return { value: { content: [{ type: 'text', text }], isError: false } }
+  })
+  on('tool.call', () => {
+    const text = 'Error: The server-side auto mode classifier gave no verdict'
+    return { result: text, text }
+  })
+  on('prompt.submit', (_, e) => {
+    prompts.push(e.text)
+    return { text: e.text }
+  })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await clock.advance(6_000)
+  expect(prompts).toHaveLength(1)
+  // Next time it asks the one that answered first.
+  asked.length = 0
+  await clock.advance(30_000)
+  expect(asked[0]).toBe('dashera')
 })

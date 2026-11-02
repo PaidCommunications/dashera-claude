@@ -35,4 +35,6 @@ Each check tells Dashera the computer's name, the app (Claude app or terminal) a
 
 ## Privacy
 
-The plugin only calls the `wake_status` tool of your own Dashera connection, directly, so it works in every permission mode (auto mode included) and nothing else skips a permission dialog. The answer carries no content: no messages, names or ids. Turn the "isn't checking in" push on or off on your agent's card in Dashera.
+The plugin only calls the `wake_status` tool of your own Dashera connection. The answer is yes or no.
+
+**Auto mode:** auto mode refuses a check that no message of yours asked for, so in auto mode the plugin needs a permission allow rule for that one tool. Add its name to `permissions.allow` in `~/.claude/settings.json`, for example `"mcp__618e79f2-adbe-49a0-a83c-37cbf0b55c46__wake_status"` (your connector's id differs; the status line names the exact tool when it is refused). In Default or Accept edits mode no rule is needed. The answer carries no content: no messages, names or ids. Turn the "isn't checking in" push on or off on your agent's card in Dashera.
