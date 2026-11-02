@@ -26,6 +26,14 @@ function pickWakeTool<T extends { name: string; description: string }>(
 }
 
 type Answer = { pending?: boolean; marker?: string | null }
+type Reply = { text: string | undefined; failed: boolean }
+
+export function blockedReason(text: string | undefined): string {
+  const t = text ?? ''
+  if (/auto mode/i.test(t)) return 'auto mode refused the check'
+  if (/permission|denied|not allowed/i.test(t)) return 'a permission rule refused the check'
+  return 'the connector refused the check'
+}
 
 function parse(text: string | undefined): Answer | null {
   if (!text) return null
@@ -33,7 +41,8 @@ function parse(text: string | undefined): Answer | null {
   const end = text.lastIndexOf('}')
   if (start < 0 || end <= start) return null
   try {
-    return JSON.parse(text.slice(start, end + 1)) as Answer
+    const a = JSON.parse(text.slice(start, end + 1)) as Answer
+    return typeof a.pending === 'boolean' ? a : null
   } catch {
     return null
   }
@@ -113,26 +122,40 @@ export const register: Register = on => {
           )
           return
         }
-        const call = (extra: Record<string, string>) =>
-          $.tool.call({
-            tool: tool.name as `mcp__${string}__${string}`,
-            ...extra,
-          } as { tool: `mcp__${string}__${string}` })
-        let result = await call(sendWhere ? where : {})
+        // The connector is called directly ($.mcp.call): the plugin's own call
+        // is the grant, so it works in every permission mode. Auto mode
+        // refuses $.tool.call here, as no message of the user's asked for it
+        // (found by the HG agent, 2 Nov). $.tool.call stays as a fallback.
+        const server = tool.name.replace(/^mcp__/, '').replace(/__wake_status$/, '')
+        const ask = async (extra: Record<string, string>): Promise<Reply> => {
+          try {
+            const r = await $.mcp.call(server, 'wake_status', extra)
+            const text = r.content
+              .map(b => ((b as { type?: string }).type === 'text' ? (b as { text: string }).text : ''))
+              .join('\n')
+            return { text: text || JSON.stringify(r.structuredContent ?? null), failed: r.isError }
+          } catch {
+            const r = await $.tool.call({
+              tool: tool.name as `mcp__${string}__${string}`,
+              ...extra,
+            } as { tool: `mcp__${string}__${string}` })
+            const text = r.text ?? JSON.stringify(r.result ?? null)
+            return { text, failed: r.deny !== undefined || !!r.isError }
+          }
+        }
+        let reply = await ask(sendWhere ? where : {})
         // A session whose connector loaded its tool list before Dashera took
         // session details refuses the extra fields: ask plainly from now on.
-        if (sendWhere && (result.deny !== undefined || result.isError)) {
+        if (sendWhere && (reply.failed || !parse(reply.text))) {
           sendWhere = false
-          result = await call({})
+          reply = await ask({})
         }
-        if (result.deny !== undefined || result.isError) {
-          $.ui.status('Live on Dashera: paused (the connector refused the check)')
+        const answer = reply.failed ? null : parse(reply.text)
+        if (!answer) {
+          // Say why instead of going quiet.
+          $.ui.status(`Live on Dashera: paused (${blockedReason(reply.text)})`)
           return
         }
-        // The answer as the model would read it; else the raw MCP result.
-        const answer =
-          parse(result.text) ?? parse(JSON.stringify(result.result ?? null))
-        if (!answer) return
         $.ui.status(answer.pending ? 'Dashera: new work waiting' : 'Live on Dashera')
         const now = await $.clock.now()
         if (

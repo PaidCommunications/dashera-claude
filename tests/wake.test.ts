@@ -103,3 +103,54 @@ test('still checks when an older connector refuses the session details', async (
   await clock.advance(6_000)
   expect(prompts).toHaveLength(1)
 })
+
+test('asks the connector directly, so auto mode cannot refuse the check', async ($, on) => {
+  const clock = mock.clock(on)
+  const ID_TOOL = 'mcp__618e79f2-adbe-49a0-a83c-37cbf0b55c46__wake_status'
+  const servers: string[] = []
+  const prompts: string[] = []
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('ui.status', () => ({ value: undefined }))
+  on('tool.list', () => ({
+    value: [{ name: ID_TOOL, description: 'is anything new addressed to you in Dashera' }],
+  }))
+  // What auto mode answers a call no message of the user's asked for.
+  on('tool.call', { tool: ID_TOOL }, () => {
+    const text = 'Error: The server-side auto mode classifier gave no verdict'
+    return { result: text, text }
+  })
+  on('mcp.call', (_, e) => {
+    servers.push(e.server)
+    const text = JSON.stringify({ pending: true, marker: 'd1', pollSeconds: 30 })
+    return { value: { content: [{ type: 'text', text }], isError: false } }
+  })
+  on('prompt.submit', (_, e) => {
+    prompts.push(e.text)
+    return { text: e.text }
+  })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await clock.advance(6_000)
+  expect(servers[0]).toBe('618e79f2-adbe-49a0-a83c-37cbf0b55c46')
+  expect(prompts).toHaveLength(1)
+})
+
+test('says the check is paused, and why, instead of going quiet', async ($, on) => {
+  const clock = mock.clock(on)
+  const statuses: (string | undefined)[] = []
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('ui.status', (_, e) => {
+    statuses.push(e.text)
+    return { value: undefined }
+  })
+  on('tool.list', () => ({ value: [{ name: TOOL, description: 'Dashera wake' }] }))
+  on('mcp.call', () => {
+    throw new Error('not connected')
+  })
+  on('tool.call', { tool: TOOL }, () => {
+    const text = 'Error: The server-side auto mode classifier gave no verdict'
+    return { result: text, text }
+  })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await clock.advance(6_000)
+  expect(statuses).toContain('Live on Dashera: paused (auto mode refused the check)')
+})
