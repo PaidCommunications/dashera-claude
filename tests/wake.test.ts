@@ -1,4 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
+import { wakePrompt } from '../hooks/register'
 
 const TOOL = 'mcp__dashera__wake_status'
 
@@ -237,4 +238,17 @@ test("doesn't ask for a rule when the connector itself refuses", async ($, on) =
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
   await clock.advance(6_000 + 30_000)
   expect(prompts).toHaveLength(0)
+})
+
+test('the first wake-up reads everything; later ones check in briefly, only where news is', () => {
+  const first = wakePrompt(true, ['Humboldt Gardens'])
+  expect(first).toContain('Humboldt Gardens')
+  expect(first).not.toContain('brief')
+  const later = wakePrompt(false, ['Humboldt Gardens'])
+  expect(later).toContain('organization "Humboldt Gardens" brief: true')
+  expect(later).not.toContain('Paid Communications')
+  expect(later.length).toBeLessThan(first.length)
+  // An older Dashera that doesn't say where: brief, without an organization.
+  expect(wakePrompt(false)).toContain('check_in brief: true')
+  expect(wakePrompt(true)).toContain('naming the organization')
 })

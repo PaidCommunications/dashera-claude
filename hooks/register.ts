@@ -9,6 +9,26 @@ import type { Register } from 'claude-code'
 
 const PROMPT =
   'Live on Dashera: something new is waiting for you. Run check_in (naming the organization if you work in more than one), handle what it lists, then call advance_cursor.'
+
+/**
+ * The turn a wake-up starts. The first in a session reads everything; later
+ * ones ask for a brief check-in, only where something is waiting (Julian,
+ * 2 Nov 2026: each wake-up re-read the whole playbook and rules, about 10 KB,
+ * in every organization).
+ */
+export function wakePrompt(first: boolean, organizations?: string[]): string {
+  const orgs = (organizations ?? []).filter(Boolean)
+  if (first) {
+    return orgs.length > 0
+      ? `Live on Dashera: something new is waiting for you in ${orgs.join(' and ')}. Run check_in (naming the organization if you work in more than one), handle what it lists, then call advance_cursor.`
+      : PROMPT
+  }
+  const where =
+    orgs.length > 0
+      ? orgs.map(o => `check_in organization "${o}" brief: true`).join('; ')
+      : 'check_in brief: true'
+  return `Dashera: new for you. ${where}; handle it, then advance_cursor.`
+}
 const POLL_MS = 30_000
 // Never two wake-ups closer than this, however busy Dashera gets.
 const MIN_GAP_MS = 2 * 60_000
@@ -34,7 +54,7 @@ export function ruleRequest(tool: string, reason: string): string {
   return `Live on Dashera can't check for new work in this conversation: ${reason}. Ask the person you work with, once and in plain words, whether to add "${tool}" to "permissions" > "allow" in ~/.claude/settings.json. It lets only that yes/no check through, nothing else. Change the file only after they say yes, keep it valid JSON, and tell them it takes effect within 30 seconds with no restart. If they say no, drop it; they can switch this conversation out of auto mode instead.`
 }
 
-type Answer = { pending?: boolean; marker?: string | null }
+type Answer = { pending?: boolean; marker?: string | null; organizations?: string[] }
 type Reply = { text: string | undefined; failed: boolean }
 
 export function blockedReason(text: string | undefined): string {
@@ -63,6 +83,7 @@ export const register: Register = on => {
   let polling = false
   let lastGood: string | undefined
   let askedForRule = false
+  let woken = false
 
   // Only this plugin's own yes/no question goes through without a dialog;
   // the model's calls and every other tool are decided as before.
@@ -201,7 +222,9 @@ export const register: Register = on => {
           lastMarker = answer.marker
           lastWakeAt = now
           // Queued: it starts its own turn once the session is idle.
-          void $.prompt.submit({ text: PROMPT }).catch(() => {})
+          const text = wakePrompt(!woken, answer.organizations)
+          woken = true
+          void $.prompt.submit({ text }).catch(() => {})
         }
       } catch {
         // The connector may be reconnecting; the next tick tries again.
