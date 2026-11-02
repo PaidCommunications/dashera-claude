@@ -284,3 +284,54 @@ test('names its session code in wake-ups, so several live sessions each take the
   // An older Dashera that gives no code: as before.
   expect(wakePrompt(false, ['Humboldt Gardens'])).toBe('New activity in Dashera: Humboldt Gardens.')
 })
+
+async function liveWithCode($: Parameters<Parameters<typeof test>[1]>[0], on: Parameters<Parameters<typeof test>[1]>[1]) {
+  const clock = mock.clock(on)
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('tool.list', () => ({ value: [{ name: TOOL, description: 'wake' }] }))
+  on('tool.call', { tool: TOOL }, () => {
+    const text = JSON.stringify({ pending: false, marker: null, session: { code: 'S-7A479F', name: null }, pollSeconds: 30 })
+    return { result: [{ type: 'text', text }], text }
+  })
+  on('prompt.submit', (_, e) => ({ text: e.text }))
+  on('ui.status', () => ({ value: undefined }))
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await clock.advance(6_000)
+}
+
+test("fills in this session's code on check_in, so the agent needn't pass it", async ($, on) => {
+  const seen: Record<string, unknown>[] = []
+  on('tool.call', { tool: 'mcp__dashera__check_in' }, (_, e) => {
+    seen.push({ ...(e as unknown as Record<string, unknown>) })
+    return { result: [{ type: 'text', text: '{}' }], text: '{}' }
+  })
+  on('tool.call', { tool: 'mcp__dashera__advance_cursor' }, (_, e) => {
+    seen.push({ ...(e as unknown as Record<string, unknown>) })
+    return { result: [{ type: 'text', text: '{}' }], text: '{}' }
+  })
+  await liveWithCode($, on)
+  await $.tool.call({ tool: 'mcp__dashera__check_in', organization: 'Humboldt Gardens' } as never)
+  expect(seen).toHaveLength(1)
+  expect(seen[0]!.session).toBe('S-7A479F')
+  // A code the agent passed itself stands.
+  await $.tool.call({ tool: 'mcp__dashera__advance_cursor', position: 'x', session: 'S-111111' } as never)
+  expect(seen[1]!.session).toBe('S-111111')
+})
+
+test('sends the call as written when an old tool list refuses the code', async ($, on) => {
+  const seen: Record<string, unknown>[] = []
+  on('tool.call', { tool: 'mcp__dashera__check_in' }, (_, e) => {
+    const args = e as unknown as Record<string, unknown>
+    seen.push({ ...args })
+    if (args.session !== undefined) {
+      const text = 'InputValidationError: An unexpected parameter `session` was provided'
+      return { result: [{ type: 'text', text }], text, isError: true }
+    }
+    return { result: [{ type: 'text', text: '{"ok":true}' }], text: '{"ok":true}' }
+  })
+  await liveWithCode($, on)
+  const r = await $.tool.call({ tool: 'mcp__dashera__check_in', organization: 'Humboldt Gardens' } as never)
+  expect(seen).toHaveLength(2)
+  expect(seen[1]!.session).toBeUndefined()
+  expect((r as { text?: string }).text).toBe('{"ok":true}')
+})

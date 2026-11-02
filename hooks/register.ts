@@ -44,6 +44,16 @@ const MIN_GAP_MS = 2 * 60_000
 // (mcp__618e79f2-...__wake_status), so the tool is found by its own name,
 // and among several by the one whose description says Dashera.
 const isWakeTool = (name: string) => /(^|__)wake_status$/.test(name)
+// The Dashera tools that take this session's code (2 Nov 2026).
+export const takesSession = (name: string) =>
+  /^mcp__.+__(check_in|advance_cursor|name_my_session)$/.test(name)
+
+// A chat app whose cached tool list predates `session` refuses the extra
+// argument before the call runs.
+export function refusedSession(r: { isError?: boolean; text?: string }): boolean {
+  const t = r.text ?? ''
+  return r.isError === true && /session/i.test(t) && /unexpected|unrecognized|not allowed|additional|invalid/i.test(t)
+}
 
 // Every Dashera wake tool, the one that last answered first, then those that
 // say Dashera, then any other.
@@ -99,6 +109,7 @@ export const register: Register = on => {
   let lastGood: string | undefined
   let askedForRule = false
   let woken = false
+  let sessionCode: string | null = null
 
   // Only this plugin's own yes/no question goes through without a dialog;
   // the model's calls and every other tool are decided as before.
@@ -111,6 +122,22 @@ export const register: Register = on => {
     // If this hook ever fails, the usual permission decision stands.
     next(e),
   )
+
+  // Fill in this session's code on the tools that take it, so the agent
+  // needn't remember it. All three are safe to send again (a read, and two
+  // writes that only move forward or set a name), so when an old tool list
+  // refuses the argument the call goes on as the agent wrote it.
+  on('tool.call', async ($, e, next) => {
+    const args = e as unknown as Record<string, unknown>
+    if (!sessionCode || !takesSession(e.tool) || typeof args.session === 'string') return next(e)
+    try {
+      const r = await next({ ...e, session: sessionCode } as typeof e)
+      if (!('deny' in r && r.deny !== undefined) && !refusedSession(r)) return r
+    } catch {
+      // Refused before it ran: send it as written below.
+    }
+    return next(e)
+  }).catch(($, e, next) => next(e))
 
   on('session.start', async ($, e, next) => {
     const started = await next(e)
@@ -227,6 +254,7 @@ export const register: Register = on => {
           return
         }
         // Older Dashera (one live session) may still say standingBy.
+        sessionCode = answer.session?.code ?? null
         const label = answer.session?.code ? ` · ${answer.session.code}` : ''
         $.ui.status(
           answer.standingBy
