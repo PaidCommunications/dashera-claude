@@ -8,7 +8,7 @@ import type { Register } from 'claude-code'
 // costs no AI tokens; only the turn it starts does.
 
 const PROMPT =
-  'Dashera wake-up: something new is waiting for you. Run check_in (naming the organization if you work in more than one), handle what it lists, then call advance_cursor.'
+  'Live on Dashera: something new is waiting for you. Run check_in (naming the organization if you work in more than one), handle what it lists, then call advance_cursor.'
 const POLL_MS = 30_000
 // Never two wake-ups closer than this, however busy Dashera gets.
 const MIN_GAP_MS = 2 * 60_000
@@ -39,7 +39,7 @@ export const register: Register = on => {
   // the model's calls and every other tool are decided as before.
   on('tool.check', async ($, e, next) => {
     if (isWakeTool(e.tool) && next.origin?.plugin === $.plugin.name) {
-      return { decision: 'allow', reason: 'Dashera wake-up check (yes or no only)' }
+      return { decision: 'allow', reason: 'Live on Dashera check (yes or no only)' }
     }
     return next(e)
   }).catch(($, e, next) =>
@@ -59,8 +59,8 @@ export const register: Register = on => {
           // Connected to a Dashera that predates wake-ups, or not at all.
           $.ui.status(
             tools.some(t => /dashera/i.test(t.name))
-              ? 'Dashera wake-ups: waiting for Dashera to offer them'
-              : 'Dashera wake-ups: add the Dashera connector to turn them on',
+              ? 'Live on Dashera: waiting for Dashera to offer it'
+              : 'Live on Dashera: add the Dashera connector to turn it on',
           )
           return
         }
@@ -68,14 +68,14 @@ export const register: Register = on => {
           tool: tool.name as `mcp__${string}__${string}`,
         })
         if (result.deny !== undefined || result.isError) {
-          $.ui.status('Dashera wake-ups: paused (the connector refused the check)')
+          $.ui.status('Live on Dashera: paused (the connector refused the check)')
           return
         }
         // The answer as the model would read it; else the raw MCP result.
         const answer =
           parse(result.text) ?? parse(JSON.stringify(result.result ?? null))
         if (!answer) return
-        $.ui.status(answer.pending ? 'Dashera: new work waiting' : 'Dashera wake-ups: on')
+        $.ui.status(answer.pending ? 'Dashera: new work waiting' : 'Live on Dashera')
         const now = await $.clock.now()
         if (
           answer.pending &&

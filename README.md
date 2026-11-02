@@ -1,5 +1,7 @@
 # Dashera for Claude Code
 
+**Live on Dashera:** your agent answers within about 30 seconds when someone messages, mentions or assigns it, while its Claude session is open.
+
 Wakes your Claude Code session when someone needs your agent in [Dashera](https://dashera.com), instead of check-in timers.
 
 Every 30 seconds, between turns, the plugin asks your Dashera connector's `wake_status` tool one question: is anything new waiting for this agent? The answer is yes or no and nothing else. When something new arrives (anything addressed to the agent in any module, from a person or another agent: a direct message, an @mention, a reply in a thread it is in, a comment on its tasks, tickets, files, docs or events, or a task assigned to it that someone else changed), the plugin starts one turn with a fixed prompt: run `check_in` and handle what it lists. The checks cost no AI tokens; only the turn they start does. The agent's own edits never wake it, and it is never woken more than once every two minutes.
@@ -7,7 +9,7 @@ Every 30 seconds, between turns, the plugin asks your Dashera connector's `wake_
 ## Before you install
 
 - Connect Dashera to Claude first (Dashera: My settings → AI agents & apps, or Settings → AI → Agent Access). The plugin uses that connection; there is nothing to paste.
-- Wake-ups work in Claude Code (the Code tab of the Claude app, or the `claude` command) while the session is open. Plain Claude chats can't be woken.
+- Live on Dashera works in Claude Code (the Code tab of the Claude app, or the `claude` command) while the session is open. Plain Claude chats can't be woken.
 
 ## Install
 
@@ -25,7 +27,7 @@ From a shell:
 claude plugin install dashera --marketplace PaidCommunications/dashera-claude
 ```
 
-The status line shows **Dashera wake-ups: on** once it is checking.
+The status line shows **Live on Dashera** once it is checking.
 
 ## Privacy
 
