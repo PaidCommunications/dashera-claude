@@ -243,7 +243,6 @@ test("doesn't ask for a rule when the connector itself refuses", async ($, on) =
 test('the first wake-up reads everything; later ones are one line naming where', () => {
   const first = wakePrompt(true, ['Example Org'])
   expect(first).toContain('Example Org')
-  expect(first).toContain('brief: true')
   expect(first).toContain('New activity in Dashera')
   expect(wakePrompt(false, ['Example Org'])).toBe('New activity in Dashera: Example Org.')
   // An older Dashera that doesn't say where.
@@ -275,11 +274,12 @@ test('stands by, and says so, while a newer session of the agent is live', async
   expect(statuses).toContain('Live on Dashera: standing by (a newer session is live)')
 })
 
-test('names its session code in wake-ups, so several live sessions each take their own', () => {
+test('names its session code in the first wake-up only; later ones stay one short line', () => {
   const first = wakePrompt(true, ['Example Org'], 'S-3F9A2C')
   expect(first).toContain('session: "S-3F9A2C"')
+  // The plugin fills the code in on later calls itself (Julian, 2 Nov 2026).
   expect(wakePrompt(false, ['Example Org'], 'S-3F9A2C')).toBe(
-    'New activity in Dashera: Example Org (session S-3F9A2C).',
+    'New activity in Dashera: Example Org.',
   )
   // An older Dashera that gives no code: as before.
   expect(wakePrompt(false, ['Example Org'])).toBe('New activity in Dashera: Example Org.')
@@ -334,4 +334,31 @@ test('sends the call as written when an old tool list refuses the code', async (
   expect(seen).toHaveLength(2)
   expect(seen[1]!.session).toBeUndefined()
   expect((r as { text?: string }).text).toBe('{"ok":true}')
+})
+
+test('a check that never answers gives up after 20 s, and the next one still runs', async ($, on) => {
+  const clock = mock.clock(on)
+  let calls = 0
+  const prompts: string[] = []
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('tool.list', () => ({ value: [{ name: TOOL, description: 'wake' }] }))
+  // HG, 2 Nov 2026: in a cloud session a hung call held every later check.
+  on('tool.call', { tool: TOOL }, () => {
+    calls += 1
+    if (calls === 1) return new Promise(() => {})
+    const text = JSON.stringify({ pending: true, marker: 'm1', pollSeconds: 30 })
+    return { result: [{ type: 'text', text }], text }
+  })
+  on('prompt.submit', (_, e) => {
+    prompts.push(e.text)
+    return { text: e.text }
+  })
+  on('ui.status', () => ({ value: undefined }))
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await clock.advance(6_000)
+  expect(prompts).toHaveLength(0)
+  await clock.advance(30_000)
+  await clock.advance(30_000)
+  expect(calls).toBeGreaterThan(1)
+  expect(prompts).toHaveLength(1)
 })

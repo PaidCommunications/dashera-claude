@@ -21,12 +21,10 @@ export function wakePrompt(
 ): string {
   const orgs = (organizations ?? []).filter(Boolean)
   const where = orgs.length > 0 ? `: ${orgs.join(', ')}` : ''
-  // Several live sessions each get their own items (2 Nov 2026): the code
-  // tells Dashera which one is asking.
-  const code = session ? ` (session ${session})` : ''
   // Later wake-ups are one line (Julian, 2 Nov 2026); the first one says
-  // what that line means for the rest of the session.
-  if (!first) return `New activity in Dashera${where}${code}.`
+  // what that line means for the rest of the session. The session code is
+  // given once: the plugin fills it in on later calls itself.
+  if (!first) return `New activity in Dashera${where}.`
   const lead =
     orgs.length > 0
       ? `Live on Dashera: something new is waiting for you in ${orgs.join(' and ')}.`
@@ -34,7 +32,7 @@ export function wakePrompt(
   const pass = session
     ? ` This session's code is ${session}: pass session: "${session}" to check_in, advance_cursor and name_my_session, so it reads and marks only its own items.`
     : ''
-  return `${lead} Run check_in (naming the organization if you work in more than one), handle what it lists, then call advance_cursor.${pass} Later in this session a wake-up only says "New activity in Dashera" and where: then run check_in with brief: true for each organization named (or for each you work in, if none is named), handle it, and call advance_cursor.`
+  return `${lead} Run check_in (naming the organization if you work in more than one), handle what it lists, then call advance_cursor.${pass} Later wake-ups only say "New activity in Dashera" and where: do the same for each organization named.`
 }
 const POLL_MS = 30_000
 // Never two wake-ups closer than this, however busy Dashera gets.
@@ -167,13 +165,24 @@ export const register: Register = on => {
       if (id) where.sessionId = id
       const cwd = await within($.session.cwd(), 3000)
       if (cwd) where.folder = cwd.split('/').filter(Boolean).pop() ?? cwd
+      // A cloud session runs in a fresh container whose hostname means
+      // nothing to its owner ("vm", HG 2 Nov 2026): say it's the cloud.
+      const remote = await within(
+        $.process.run(['printenv', 'CLAUDE_CODE_REMOTE'], { timeoutMs: 2000 }),
+        3000,
+      )
+      if (remote && remote.exitCode === 0 && remote.stdout.trim() === 'true') {
+        where.machine = 'Cloud'
+        return
+      }
       for (const argv of [
         ['scutil', '--get', 'ComputerName'],
         ['hostname', '-s'],
       ]) {
         const r = await within($.process.run(argv, { timeoutMs: 2000 }), 3000)
         if (r && r.exitCode === 0 && r.stdout.trim()) {
-          where.machine = r.stdout.trim().slice(0, 80)
+          const name = r.stdout.trim().slice(0, 80)
+          where.machine = argv[0] === 'hostname' && name === 'vm' ? 'Cloud' : name
           break
         }
       }
@@ -222,14 +231,23 @@ export const register: Register = on => {
             }
           }
         }
+        // A check that never answers must not stop the next ones: in a cloud
+        // session a hung call held every later check for 6 minutes and the
+        // session showed as not live (HG, 2 Nov 2026). Give up after 20 s;
+        // the next tick asks again.
+        const TIMED_OUT: Reply = { text: 'timed out', failed: true }
+        const askWithin = async (name: string, extra: Record<string, string>) =>
+          (await within(ask(name, extra), 20_000)) ?? TIMED_OUT
         let answer: Answer | null = null
         let refused: Reply | undefined
         for (const t of found) {
-          let reply = await ask(t.name, sendWhere ? where : {})
+          let reply = await askWithin(t.name, sendWhere ? where : {})
+          if (reply === TIMED_OUT) return
           // A session whose connector loaded its tool list before Dashera took
           // session details refuses the extra fields: ask plainly from now on.
           if (sendWhere && (reply.failed || !parse(reply.text))) {
-            reply = await ask(t.name, {})
+            reply = await askWithin(t.name, {})
+            if (reply === TIMED_OUT) return
             if (!reply.failed && parse(reply.text)) sendWhere = false
           }
           answer = reply.failed ? null : parse(reply.text)
