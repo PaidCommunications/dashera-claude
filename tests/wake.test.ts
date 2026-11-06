@@ -1,5 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
-import { wakePrompt } from '../hooks/register'
+import { dropWhereAfter, wakePrompt } from '../hooks/register'
 
 const TOOL = 'mcp__dashera__wake_status'
 
@@ -409,4 +409,15 @@ test('says when this conversation is open but not connected (opt-in, 5 Nov 2026)
   await clock.advance(6_000)
   expect(statuses.at(-1)).toContain('not connected')
   expect(prompts).toHaveLength(0)
+})
+
+test('a failed check never drops the session details; only a refusal of the fields does', () => {
+  const ok = { text: '{"pending":false}', failed: false }
+  // A deploy restarting the server, or a timeout: keep sending them.
+  expect(dropWhereAfter({ text: 'fetch failed: 502', failed: true }, ok)).toBe(false)
+  expect(dropWhereAfter({ text: 'timed out', failed: true }, ok)).toBe(false)
+  // The connector's cached schema refuses the extra fields: drop them.
+  expect(dropWhereAfter({ text: 'Unexpected property sessionId', failed: true }, ok)).toBe(true)
+  // The plain check failed too: nothing learned, keep them.
+  expect(dropWhereAfter({ text: 'Unexpected property sessionId', failed: true }, { text: 'x', failed: true })).toBe(false)
 })

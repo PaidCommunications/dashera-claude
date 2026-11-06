@@ -53,6 +53,19 @@ export function refusedSession(r: { isError?: boolean; text?: string }): boolean
   return r.isError === true && /session/i.test(t) && /unexpected|unrecognized|not allowed|additional|invalid/i.test(t)
 }
 
+// Whether to stop sending where this check runs (sessionId, machine, app,
+// folder). Only when the connector refused those fields outright (an app
+// whose cached tool list predates them) and a plain check then worked.
+// A check that merely failed (a deploy restarting the server, a timeout)
+// never drops them: without the sessionId Dashera can't tell this
+// conversation from the agent's others and wakes it for all of their work
+// (HG, 6 Nov 2026: every live session woken for every item after a deploy).
+export function dropWhereAfter(first: Reply, plain: Reply): boolean {
+  if (plain.failed || !plain.text) return false
+  return first.failed && /session|machine|folder|\bapp\b/i.test(first.text ?? '') &&
+    /unexpected|unrecognized|not allowed|additional|invalid|unknown/i.test(first.text ?? '')
+}
+
 // Every Dashera wake tool, the one that last answered first, then those that
 // say Dashera, then any other.
 export function wakeTools<T extends { name: string; description: string }>(
@@ -192,8 +205,20 @@ export const register: Register = on => {
     // On the plugin's own timer, after the start-up step has finished.
     $.clock.after(1000, () => void gather())
     let sendWhere = true
+    let whereDroppedAt = 0
+    let waitedForId = 0
     const tick = async () => {
       if (polling) return
+      // Never check before this conversation's id is known (up to ~30 s):
+      // a check without it can't be told apart from the agent's others.
+      if (!where.sessionId && waitedForId < 6) {
+        waitedForId += 1
+        if (waitedForId === 1 || waitedForId === 3) void gather()
+        return
+      }
+      // A connector that refused the details may have been updated: offer
+      // them again every 5 minutes.
+      if (!sendWhere && Date.now() - whereDroppedAt > 5 * 60_000) sendWhere = true
       polling = true
       try {
         const tools = await $.tool.list()
@@ -248,9 +273,13 @@ export const register: Register = on => {
           // A session whose connector loaded its tool list before Dashera took
           // session details refuses the extra fields: ask plainly from now on.
           if (sendWhere && (reply.failed || !parse(reply.text))) {
+            const first = reply
             reply = await askWithin(t.name, {})
             if (reply === TIMED_OUT) return
-            if (!reply.failed && parse(reply.text)) sendWhere = false
+            if (!reply.failed && parse(reply.text) && dropWhereAfter(first, reply)) {
+              sendWhere = false
+              whereDroppedAt = Date.now()
+            }
           }
           answer = reply.failed ? null : parse(reply.text)
           if (answer) {
