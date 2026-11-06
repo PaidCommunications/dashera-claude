@@ -1,6 +1,6 @@
 import type { Register } from 'claude-code'
 
-// Dashera wake-ups (1 Nov 2026). Every 30 seconds, between turns, ask the
+// Dashera wake-ups (1 Nov 2026). Every 15 seconds (30 until 5 Nov 2026), between turns, ask the
 // Dashera connector's wake_status tool "is anything new waiting for me?".
 // It answers yes/no and an opaque marker, nothing else. When the answer is
 // yes with a marker not seen before, start one turn with the fixed prompt
@@ -34,7 +34,7 @@ export function wakePrompt(
     : ''
   return `${lead} Run check_in (naming the organization if you work in more than one), handle what it lists, then call advance_cursor.${pass} Later wake-ups only say "New activity in Dashera" and where: do the same for each organization named.`
 }
-const POLL_MS = 30_000
+const POLL_MS = 15_000
 // Never two wake-ups closer than this, however busy Dashera gets.
 const MIN_GAP_MS = 2 * 60_000
 
@@ -233,11 +233,11 @@ export const register: Register = on => {
         }
         // A check that never answers must not stop the next ones: in a cloud
         // session a hung call held every later check for 6 minutes and the
-        // session showed as not live (HG, 2 Nov 2026). Give up after 20 s;
-        // the next tick asks again.
+        // session showed as not live (HG, 2 Nov 2026). Give up after 12 s,
+        // inside one 15-second tick; the next tick asks again.
         const TIMED_OUT: Reply = { text: 'timed out', failed: true }
         const askWithin = async (name: string, extra: Record<string, string>) =>
-          (await within(ask(name, extra), 20_000)) ?? TIMED_OUT
+          (await within(ask(name, extra), 12_000)) ?? TIMED_OUT
         let answer: Answer | null = null
         let refused: Reply | undefined
         for (const t of found) {

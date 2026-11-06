@@ -336,7 +336,7 @@ test('sends the call as written when an old tool list refuses the code', async (
   expect((r as { text?: string }).text).toBe('{"ok":true}')
 })
 
-test('a check that never answers gives up after 20 s, and the next one still runs', async ($, on) => {
+test('a check that never answers gives up after 12 s, and the next one still runs', async ($, on) => {
   const clock = mock.clock(on)
   let calls = 0
   const prompts: string[] = []
@@ -361,4 +361,22 @@ test('a check that never answers gives up after 20 s, and the next one still run
   await clock.advance(30_000)
   expect(calls).toBeGreaterThan(1)
   expect(prompts).toHaveLength(1)
+})
+
+test('checks every 15 seconds (5 Nov 2026; it was 30)', async ($, on) => {
+  const clock = mock.clock(on)
+  let calls = 0
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('tool.list', () => ({ value: [{ name: TOOL, description: 'wake' }] }))
+  on('tool.call', { tool: TOOL }, () => {
+    calls += 1
+    const text = JSON.stringify({ pending: false, marker: null, pollSeconds: 15 })
+    return { result: [{ type: 'text', text }], text }
+  })
+  on('ui.status', () => ({ value: undefined }))
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await clock.advance(6_000)
+  expect(calls).toBe(1)
+  await clock.advance(30_000)
+  expect(calls).toBe(3)
 })
