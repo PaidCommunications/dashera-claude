@@ -380,3 +380,33 @@ test('checks every 15 seconds (5 Nov 2026; it was 30)', async ($, on) => {
   await clock.advance(30_000)
   expect(calls).toBe(3)
 })
+
+test('says when this conversation is open but not connected (opt-in, 5 Nov 2026)', async ($, on) => {
+  const clock = mock.clock(on)
+  const statuses: (string | undefined)[] = []
+  const prompts: string[] = []
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('tool.list', () => ({ value: [{ name: TOOL, description: 'wake' }] }))
+  on('tool.call', { tool: TOOL }, () => {
+    const text = JSON.stringify({
+      pending: false,
+      marker: null,
+      pollSeconds: 15,
+      connected: false,
+      session: { code: 'S-ABC123', name: null },
+    })
+    return { result: [{ type: 'text', text }], text }
+  })
+  on('prompt.submit', (_, e) => {
+    prompts.push(e.text)
+    return { text: e.text }
+  })
+  on('ui.status', (_, e) => {
+    statuses.push(e.text)
+    return { value: undefined }
+  })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await clock.advance(6_000)
+  expect(statuses.at(-1)).toContain('not connected')
+  expect(prompts).toHaveLength(0)
+})

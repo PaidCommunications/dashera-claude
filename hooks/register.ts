@@ -77,6 +77,8 @@ type Answer = {
   standingBy?: boolean
   // This session's code and name, for the agent to pass as session.
   session?: { code: string; name: string | null }
+  // False: this conversation isn't connected yet (opt-in, 5 Nov 2026).
+  connected?: boolean
 }
 type Reply = { text: string | undefined; failed: boolean }
 
@@ -275,7 +277,9 @@ export const register: Register = on => {
         sessionCode = answer.session?.code ?? null
         const label = answer.session?.code ? ` · ${answer.session.code}` : ''
         $.ui.status(
-          answer.standingBy
+          answer.connected === false
+            ? 'Dashera: not connected (paste the connect message to make this a live session)'
+            : answer.standingBy
             ? 'Live on Dashera: standing by (a newer session is live)'
             : answer.pending
               ? `Dashera: new work waiting${label}`
