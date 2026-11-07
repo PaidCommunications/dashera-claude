@@ -31,7 +31,7 @@ The status line shows **Live on Dashera** once it is checking.
 
 ## Where it's running
 
-Each check tells Dashera the computer's name, the app (Claude app or terminal) and the session's folder, so the agent's card shows every place it is live. If the agent is open in two places, each new item goes to one of them, so it never answers twice. The agent may also give the session a name of its own.
+Each check tells Dashera the computer's name, the app (Claude app or terminal), the session's folder and the plugin's version, so the agent's card shows every place it is live. If the agent is open in two places, each new item goes to one of them, so it never answers twice. The agent may also give the session a name of its own.
 
 ## Session names follow the conversation
 
@@ -41,6 +41,7 @@ The other way too: **Rename** the session on its card in Dashera and this conver
 
 ## What's new
 
+- **0.2.15:** each check also sends the plugin's own version, so Dashera can show on the agent's card when a session's heartbeat is out of date (and the agent can tell you). A conversation whose live session was ended (by itself, or with End live session on the agent's card) stops checking until the next message you send in it; it connects again only when you paste the connect prompt from the card. After updating, quit and reopen the Claude app (or start a new `claude` session).
 - **0.2.14:** session names follow the conversation's title, both ways (see above). Each check may carry `title`; the answer carries `name` and `nameSource`. After updating, quit and reopen the Claude app (or start a new `claude` session) so the new version loads: a plugin's code is read when a session starts.
 - **0.2.13:** a failed check never stops sending this conversation's id.
 - **0.2.12:** the status line says when a conversation is open but not connected (opt-in live sessions).

@@ -1,4 +1,5 @@
 import type { Register } from 'claude-code'
+import { PLUGIN_VERSION } from './version'
 
 // Dashera wake-ups (1 Nov 2026). Every 15 seconds (30 until 5 Nov 2026), between turns, ask the
 // Dashera connector's wake_status tool "is anything new waiting for me?".
@@ -6,6 +7,11 @@ import type { Register } from 'claude-code'
 // yes with a marker not seen before, start one turn with the fixed prompt
 // below. The check is a plain tool call outside any model turn, so waiting
 // costs no AI tokens; only the turn it starts does.
+//
+// Version and end (0.2.15, Julian, 7 Nov 2026): every check sends the
+// plugin's own version (`version`, the same field the Codex watcher uses),
+// and a conversation whose live session was ended stops checking until its
+// next prompt (the connect prompt brings it back).
 //
 // Rename sync (0.2.14, Julian, 7 Nov 2026): the check also carries this
 // conversation's title when it changed, read from the tail of the
@@ -137,7 +143,7 @@ export function refusedSession(r: { isError?: boolean; text?: string }): boolean
 // (HG, 6 Nov 2026: every live session woken for every item after a deploy).
 export function dropWhereAfter(first: Reply, plain: Reply): boolean {
   if (plain.failed || !plain.text) return false
-  return first.failed && /session|machine|folder|\bapp\b/i.test(first.text ?? '') &&
+  return first.failed && /session|machine|folder|version|title|\bapp\b/i.test(first.text ?? '') &&
     /unexpected|unrecognized|not allowed|additional|invalid|unknown/i.test(first.text ?? '')
 }
 
@@ -172,7 +178,13 @@ type Answer = {
   // conversation's title, "agent" after name_my_session (0.2.14).
   name?: string | null
   nameSource?: 'agent' | 'owner' | 'title' | null
+  // This conversation's live session was ended on purpose (0.2.15): stop
+  // checking until the next prompt here.
+  ended?: { at: string; by: 'session' | 'owner' } | null
 }
+
+/** The status line for an ended session (0.2.15). */
+export const ENDED_STATUS = 'Dashera: live session ended (paste the connect prompt to connect it again)'
 type Reply = { text: string | undefined; failed: boolean }
 
 export function blockedReason(text: string | undefined): string {
@@ -209,6 +221,8 @@ export const register: Register = on => {
   let title: string | null = null
   let lastSentTitle: string | null = null
   let pendingTitle: string | null = null
+  // Ended (0.2.15): no checks until a prompt arrives in this conversation.
+  let endedPause = false
 
   // The owner renamed the session in Dashera: the conversation takes that
   // name at the next prompt Claude Code allows a title on (a wake-up's
@@ -220,7 +234,11 @@ export const register: Register = on => {
     title = name
     return { ...r, sessionTitle: name }
   }
-  on('classic.UserPromptSubmit', async ($, e, next) => followDashera(await next(e))).catch(
+  on('classic.UserPromptSubmit', async ($, e, next) => {
+    // A prompt here (the connect prompt, say) may connect it again: check.
+    endedPause = false
+    return followDashera(await next(e))
+  }).catch(
     ($, e, next) => next(e),
   )
   on('classic.SessionStart', async ($, e, next) => followDashera(await next(e))).catch(
@@ -263,6 +281,8 @@ export const register: Register = on => {
     // the checks (a host command can wait on the app indefinitely).
     const where: Record<string, string> = {}
     const surface = (e as { surface?: string }).surface
+    // The plugin's own version goes with every check (0.2.15).
+    where.version = PLUGIN_VERSION
     where.app =
       surface === 'desktop'
         ? 'Claude app'
@@ -359,7 +379,7 @@ export const register: Register = on => {
     let whereDroppedAt = 0
     let waitedForId = 0
     const tick = async () => {
-      if (polling) return
+      if (polling || endedPause) return
       // Never check before this conversation's id is known (up to ~30 s):
       // a check without it can't be told apart from the agent's others.
       if (!where.sessionId && waitedForId < 6) {
@@ -462,6 +482,14 @@ export const register: Register = on => {
             // A refused or failed submit just means no reminder this time.
             void $.prompt.submit({ text: ruleRequest(found[0]!.name, reason) }).catch(() => {})
           }
+          return
+        }
+        // Ended on purpose (0.2.15): say so and stop checking until the next
+        // prompt in this conversation.
+        if (answer.ended) {
+          endedPause = true
+          sessionCode = null
+          $.ui.status(ENDED_STATUS)
           return
         }
         // Older Dashera (one live session) may still say standingBy.
