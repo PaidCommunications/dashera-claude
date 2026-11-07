@@ -3,8 +3,17 @@ import { dropWhereAfter, wakePrompt } from '../hooks/register'
 
 const TOOL = 'mcp__dashera__wake_status'
 
+// The harness has no session id or folder of its own; the plugin waits for
+// this conversation's id before its first check (0.2.13), so every test
+// gives it one.
+const whereMocks = (on: Parameters<Parameters<typeof test>[1]>[1]) => {
+  on('session.id', () => ({ value: 'sess-test' }))
+  on('session.cwd', () => ({ value: '/w' }))
+}
+
 test('wakes once per new marker, never more often than every two minutes', async ($, on) => {
   const clock = mock.clock(on)
+  whereMocks(on)
   let answer = { pending: false, marker: null as string | null }
   const prompts: string[] = []
   on('session.start', (_, e) => ({ cwd: e.cwd }))
@@ -43,6 +52,7 @@ test('wakes once per new marker, never more often than every two minutes', async
 
 test('says what to do when the Dashera connector is missing', async ($, on) => {
   const clock = mock.clock(on)
+  whereMocks(on)
   const statuses: (string | undefined)[] = []
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('tool.list', () => ({ value: [] }))
@@ -57,6 +67,7 @@ test('says what to do when the Dashera connector is missing', async ($, on) => {
 
 test('finds Dashera under a connector named by an id', async ($, on) => {
   const clock = mock.clock(on)
+  whereMocks(on)
   const ID_TOOL = 'mcp__618e79f2-adbe-49a0-a83c-37cbf0b55c46__wake_status'
   const prompts: string[] = []
   on('session.start', (_, e) => ({ cwd: e.cwd }))
@@ -82,6 +93,7 @@ test('finds Dashera under a connector named by an id', async ($, on) => {
 
 test('still checks when an older connector refuses the session details', async ($, on) => {
   const clock = mock.clock(on)
+  whereMocks(on)
   const TOOL2 = 'mcp__abc__wake_status'
   const calls: Record<string, unknown>[] = []
   const prompts: string[] = []
@@ -107,6 +119,7 @@ test('still checks when an older connector refuses the session details', async (
 
 test('asks the connector directly first', async ($, on) => {
   const clock = mock.clock(on)
+  whereMocks(on)
   const ID_TOOL = 'mcp__618e79f2-adbe-49a0-a83c-37cbf0b55c46__wake_status'
   const servers: string[] = []
   const prompts: string[] = []
@@ -137,6 +150,7 @@ test('asks the connector directly first', async ($, on) => {
 
 test('says the check is paused, and why, instead of going quiet', async ($, on) => {
   const clock = mock.clock(on)
+  whereMocks(on)
   const statuses: (string | undefined)[] = []
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('ui.status', (_, e) => {
@@ -158,6 +172,7 @@ test('says the check is paused, and why, instead of going quiet', async ($, on) 
 
 test('with two Dashera connectors, uses the one a permission rule allows', async ($, on) => {
   const clock = mock.clock(on)
+  whereMocks(on)
   const REFUSED = 'mcp__618e79f2-adbe-49a0-a83c-37cbf0b55c46__wake_status'
   const ALLOWED = 'mcp__dashera__wake_status'
   const prompts: string[] = []
@@ -196,6 +211,7 @@ test('with two Dashera connectors, uses the one a permission rule allows', async
 
 test('asks once, through the agent, for the one-tool rule when auto mode blocks the check', async ($, on) => {
   const clock = mock.clock(on)
+  whereMocks(on)
   const ID_TOOL = 'mcp__618e79f2-adbe-49a0-a83c-37cbf0b55c46__wake_status'
   const prompts: string[] = []
   on('session.start', (_, e) => ({ cwd: e.cwd }))
@@ -223,6 +239,7 @@ test('asks once, through the agent, for the one-tool rule when auto mode blocks 
 
 test("doesn't ask for a rule when the connector itself refuses", async ($, on) => {
   const clock = mock.clock(on)
+  whereMocks(on)
   const prompts: string[] = []
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('ui.status', () => ({ value: undefined }))
@@ -252,6 +269,7 @@ test('the first wake-up reads everything; later ones are one line naming where',
 
 test('stands by, and says so, while a newer session of the agent is live', async ($, on) => {
   const clock = mock.clock(on)
+  whereMocks(on)
   const prompts: string[] = []
   const statuses: (string | undefined)[] = []
   on('session.start', (_, e) => ({ cwd: e.cwd }))
@@ -287,6 +305,7 @@ test('names its session code in the first wake-up only; later ones stay one shor
 
 async function liveWithCode($: Parameters<Parameters<typeof test>[1]>[0], on: Parameters<Parameters<typeof test>[1]>[1]) {
   const clock = mock.clock(on)
+  whereMocks(on)
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('tool.list', () => ({ value: [{ name: TOOL, description: 'wake' }] }))
   on('tool.call', { tool: TOOL }, () => {
@@ -338,6 +357,7 @@ test('sends the call as written when an old tool list refuses the code', async (
 
 test('a check that never answers gives up after 12 s, and the next one still runs', async ($, on) => {
   const clock = mock.clock(on)
+  whereMocks(on)
   let calls = 0
   const prompts: string[] = []
   on('session.start', (_, e) => ({ cwd: e.cwd }))
@@ -365,6 +385,7 @@ test('a check that never answers gives up after 12 s, and the next one still run
 
 test('checks every 15 seconds (5 Nov 2026; it was 30)', async ($, on) => {
   const clock = mock.clock(on)
+  whereMocks(on)
   let calls = 0
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('tool.list', () => ({ value: [{ name: TOOL, description: 'wake' }] }))
@@ -383,6 +404,7 @@ test('checks every 15 seconds (5 Nov 2026; it was 30)', async ($, on) => {
 
 test('says when this conversation is open but not connected (opt-in, 5 Nov 2026)', async ($, on) => {
   const clock = mock.clock(on)
+  whereMocks(on)
   const statuses: (string | undefined)[] = []
   const prompts: string[] = []
   on('session.start', (_, e) => ({ cwd: e.cwd }))

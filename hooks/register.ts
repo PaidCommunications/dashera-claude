@@ -6,6 +6,13 @@ import type { Register } from 'claude-code'
 // yes with a marker not seen before, start one turn with the fixed prompt
 // below. The check is a plain tool call outside any model turn, so waiting
 // costs no AI tokens; only the turn it starts does.
+//
+// Rename sync (0.2.14, Julian, 7 Nov 2026): the check also carries this
+// conversation's title when it changed, read from the tail of the
+// conversation's transcript (never its content), so the session's name in
+// Dashera follows a rename here; and a name the owner gives the session in
+// Dashera is put on this conversation at its next prompt. No AI tokens
+// either way.
 
 /**
  * The turn a wake-up starts. The first in a session reads everything; later
@@ -37,6 +44,74 @@ export function wakePrompt(
 const POLL_MS = 15_000
 // Never two wake-ups closer than this, however busy Dashera gets.
 const MIN_GAP_MS = 2 * 60_000
+
+// ---- Rename sync (0.2.14) ----
+/** A session name in Dashera is at most this long. */
+export const TITLE_MAX = 60
+/** The transcript's tail is read again at most this often. */
+export const TITLE_REFRESH_MS = 60_000
+/** How much of the transcript's end is read: a rename line is tiny. */
+export const TITLE_TAIL_BYTES = 64 * 1024
+/** $.fs.read refuses a file over this; `tail` is tried first. */
+const FS_READ_LIMIT = 4 * 1024 * 1024
+
+/**
+ * The folder under ~/.claude/projects that holds a working folder's
+ * transcripts: its path with every character that isn't a letter or a digit
+ * replaced by "-" ("/" and " " alike, as the folders on a Mac show).
+ */
+export function projectFolderOf(cwd: string): string {
+  return cwd.replace(/[^A-Za-z0-9]/g, '-')
+}
+
+/** Where Claude Code writes this conversation's transcript. */
+export function transcriptPath(home: string, cwd: string, sessionId: string): string {
+  return `${home.replace(/\/+$/, '')}/.claude/projects/${projectFolderOf(cwd)}/${sessionId}.jsonl`
+}
+
+/**
+ * The conversation's title now, from the end of its transcript: Claude Code
+ * appends {"type":"custom-title","customTitle":"…"} when it is renamed, and
+ * the last such line is current. A tail may begin in the middle of a line;
+ * only whole lines parse. Null when the conversation was never renamed.
+ */
+export function lastCustomTitle(tail: string): string | null {
+  const lines = tail.split('\n')
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i]!
+    if (!line.includes('"custom-title"')) continue
+    try {
+      const row = JSON.parse(line) as { type?: unknown; customTitle?: unknown }
+      if (row.type === 'custom-title' && typeof row.customTitle === 'string') {
+        const title = row.customTitle.trim().slice(0, TITLE_MAX)
+        return title || null
+      }
+    } catch {
+      // A line the tail cut, or not JSON: look further up.
+    }
+  }
+  return null
+}
+
+/** The title to send with this check: only one that differs from the last sent. */
+export function titleToSend(current: string | null, lastSent: string | null): string | null {
+  return current && current !== lastSent ? current : null
+}
+
+/**
+ * The other direction: the name to put on this conversation, when its owner
+ * renamed the session in Dashera (nameSource "owner") and the conversation's
+ * title differs. A name the agent gave, or one that follows the title
+ * already, changes nothing here.
+ */
+export function titleFromDashera(
+  answer: { name?: string | null; nameSource?: string | null },
+  title: string | null,
+): string | null {
+  if (answer.nameSource !== 'owner') return null
+  const name = (answer.name ?? '').trim().slice(0, TITLE_MAX)
+  return name && name !== title ? name : null
+}
 
 // Connectors added from claude.ai are named by an id
 // (mcp__618e79f2-...__wake_status), so the tool is found by its own name,
@@ -92,6 +167,11 @@ type Answer = {
   session?: { code: string; name: string | null }
   // False: this conversation isn't connected yet (opt-in, 5 Nov 2026).
   connected?: boolean
+  // The session's name in Dashera and who set it: "owner" after Rename on
+  // its card (then this conversation takes it), "title" when it follows this
+  // conversation's title, "agent" after name_my_session (0.2.14).
+  name?: string | null
+  nameSource?: 'agent' | 'owner' | 'title' | null
 }
 type Reply = { text: string | undefined; failed: boolean }
 
@@ -123,6 +203,29 @@ export const register: Register = on => {
   let askedForRule = false
   let woken = false
   let sessionCode: string | null = null
+  // Rename sync (0.2.14): this conversation's title as its transcript last
+  // said, the title last sent to Dashera, and a name the owner gave the
+  // session in Dashera, waiting to go on this conversation.
+  let title: string | null = null
+  let lastSentTitle: string | null = null
+  let pendingTitle: string | null = null
+
+  // The owner renamed the session in Dashera: the conversation takes that
+  // name at the next prompt Claude Code allows a title on (a wake-up's
+  // prompt counts). The title read from the transcript later confirms it.
+  const followDashera = <R extends { sessionTitle?: string }>(r: R): R => {
+    if (!pendingTitle) return r
+    const name = pendingTitle
+    pendingTitle = null
+    title = name
+    return { ...r, sessionTitle: name }
+  }
+  on('classic.UserPromptSubmit', async ($, e, next) => followDashera(await next(e))).catch(
+    ($, e, next) => next(e),
+  )
+  on('classic.SessionStart', async ($, e, next) => followDashera(await next(e))).catch(
+    ($, e, next) => next(e),
+  )
 
   // Only this plugin's own yes/no question goes through without a dialog;
   // the model's calls and every other tool are decided as before.
@@ -175,11 +278,19 @@ export const register: Register = on => {
           $.clock.after(ms, () => r(undefined))
         }),
       ])
+    // For the transcript's path (rename sync): the whole working folder
+    // and the home folder. Neither is sent anywhere.
+    let cwdFull: string | null = null
+    let home: string | null = null
     const gather = async () => {
       const id = await within($.session.id(), 3000)
       if (id) where.sessionId = id
       const cwd = await within($.session.cwd(), 3000)
-      if (cwd) where.folder = cwd.split('/').filter(Boolean).pop() ?? cwd
+      if (cwd) {
+        cwdFull = cwd
+        where.folder = cwd.split('/').filter(Boolean).pop() ?? cwd
+      }
+      home ??= (await within($.env.get('HOME'), 2000)) ?? null
       // A cloud session runs in a fresh container whose hostname means
       // nothing to its owner ("vm", HG 2 Nov 2026): say it's the cloud.
       const remote = await within(
@@ -204,6 +315,46 @@ export const register: Register = on => {
     }
     // On the plugin's own timer, after the start-up step has finished.
     $.clock.after(1000, () => void gather())
+    // Rename sync: the transcript file, found once (it appears with the
+    // first message), and its tail read at most every TITLE_REFRESH_MS.
+    let transcript: string | null = null
+    let titleReadAt = Number.NEGATIVE_INFINITY
+    const findTranscript = async (): Promise<string | null> => {
+      if (!where.sessionId || !cwdFull || !home) return null
+      const expected = transcriptPath(home, cwdFull, where.sessionId)
+      if (await within($.fs.exists(expected), 2000)) return expected
+      // Another folder spelling (a link, another version): look for the
+      // file by this conversation's id under ~/.claude/projects.
+      const root = `${home}/.claude/projects`
+      const dirs = (await within($.fs.list(root), 3000)) ?? []
+      for (const d of dirs) {
+        if (d.kind !== 'dir') continue
+        const p = `${root}/${d.name}/${where.sessionId}.jsonl`
+        if (await within($.fs.exists(p), 1000)) return p
+      }
+      return null
+    }
+    const readTitle = async () => {
+      transcript ??= await findTranscript()
+      if (!transcript) return
+      // Only the end of the file: a transcript can be hundreds of MB.
+      const tail = await within(
+        $.process.run(['tail', '-c', String(TITLE_TAIL_BYTES), transcript], { timeoutMs: 3000 }),
+        4000,
+      )
+      let text = tail && tail.exitCode === 0 ? tail.stdout : null
+      if (text === null) {
+        // No tail command (Windows): the whole file, while it is small.
+        const stat = await within($.fs.stat(transcript), 2000)
+        if (stat && stat.kind === 'file' && stat.size <= FS_READ_LIMIT) {
+          const whole = await within($.fs.read(transcript), 4000)
+          if (typeof whole === 'string') text = whole
+        }
+      }
+      if (text === null) return
+      const found = lastCustomTitle(text)
+      if (found) title = found
+    }
     let sendWhere = true
     let whereDroppedAt = 0
     let waitedForId = 0
@@ -221,6 +372,11 @@ export const register: Register = on => {
       if (!sendWhere && Date.now() - whereDroppedAt > 5 * 60_000) sendWhere = true
       polling = true
       try {
+        const at = await $.clock.now()
+        if (at - titleReadAt >= TITLE_REFRESH_MS) {
+          titleReadAt = at
+          await readTitle()
+        }
         const tools = await $.tool.list()
         const found = wakeTools(tools, lastGood)
         if (found.length === 0) {
@@ -267,14 +423,19 @@ export const register: Register = on => {
           (await within(ask(name, extra), 12_000)) ?? TIMED_OUT
         let answer: Answer | null = null
         let refused: Reply | undefined
+        // The conversation's title goes with the details, when it changed.
+        const sending = titleToSend(title, lastSentTitle)
+        const extra = sendWhere ? { ...where, ...(sending ? { title: sending } : {}) } : {}
         for (const t of found) {
-          let reply = await askWithin(t.name, sendWhere ? where : {})
+          let reply = await askWithin(t.name, extra)
+          let withDetails = sendWhere
           if (reply === TIMED_OUT) return
           // A session whose connector loaded its tool list before Dashera took
           // session details refuses the extra fields: ask plainly from now on.
           if (sendWhere && (reply.failed || !parse(reply.text))) {
             const first = reply
             reply = await askWithin(t.name, {})
+            withDetails = false
             if (reply === TIMED_OUT) return
             if (!reply.failed && parse(reply.text) && dropWhereAfter(first, reply)) {
               sendWhere = false
@@ -284,6 +445,7 @@ export const register: Register = on => {
           answer = reply.failed ? null : parse(reply.text)
           if (answer) {
             lastGood = t.name
+            if (withDetails && sending) lastSentTitle = sending
             break
           }
           refused ??= reply
@@ -304,6 +466,10 @@ export const register: Register = on => {
         }
         // Older Dashera (one live session) may still say standingBy.
         sessionCode = answer.session?.code ?? null
+        // Renamed on its card in Dashera: this conversation takes the name
+        // at its next prompt.
+        const fromDashera = titleFromDashera(answer, title)
+        if (fromDashera) pendingTitle = fromDashera
         const label = answer.session?.code ? ` · ${answer.session.code}` : ''
         $.ui.status(
           answer.connected === false

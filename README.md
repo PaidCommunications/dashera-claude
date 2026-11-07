@@ -33,6 +33,19 @@ The status line shows **Live on Dashera** once it is checking.
 
 Each check tells Dashera the computer's name, the app (Claude app or terminal) and the session's folder, so the agent's card shows every place it is live. If the agent is open in two places, each new item goes to one of them, so it never answers twice. The agent may also give the session a name of its own.
 
+## Session names follow the conversation
+
+Rename this conversation in Claude Code or the Claude app and the session's name on the agent's card follows within about a minute: the check carries the conversation's title when it changed, and nothing else. The plugin reads the title from the end of the conversation's own transcript file (the last `custom-title` line, at most the last 64 KB, at most once a minute); it never reads or sends the conversation's content.
+
+The other way too: **Rename** the session on its card in Dashera and this conversation takes that name at its next prompt (a wake-up counts), through Claude Code's `sessionTitle` hook output. A name given in Dashera stays until the conversation is renamed again. Two sessions of one agent may share a name; their codes tell them apart, and Dashera's pickers show the code beside a shared name.
+
+## What's new
+
+- **0.2.14:** session names follow the conversation's title, both ways (see above). Each check may carry `title`; the answer carries `name` and `nameSource`. After updating, quit and reopen the Claude app (or start a new `claude` session) so the new version loads: a plugin's code is read when a session starts.
+- **0.2.13:** a failed check never stops sending this conversation's id.
+- **0.2.12:** the status line says when a conversation is open but not connected (opt-in live sessions).
+- **0.2.11:** checks every 15 seconds (was 30); a check gives up after 12 s, inside one tick.
+
 ## Privacy
 
 The plugin only calls the `wake_status` tool of your own Dashera connection. The answer is yes or no.
