@@ -8,7 +8,7 @@ Every 15 seconds, between turns, the plugin asks your Dashera connector's `wake_
 
 ## What the plugin sends
 
-Every 15 seconds while a conversation is open, the plugin calls your Dashera connection's `wake_status` tool with: the conversation's id, the computer's name, the app (Claude app or terminal), the folder name, the plugin's version, and the conversation's title when it changes. It never reads or sends what you write in the conversation. A conversation gets wake-ups only after it is connected and named, and End live session on the agent's card disconnects it. The answer is yes or no.
+Every 15 seconds while a conversation is open, the plugin calls your Dashera connection's `wake_status` tool with: the conversation's id, the computer's name, the app (Claude app or terminal), the folder name, the plugin's version, the conversation's title when it changes, and, when the conversation goes on under a new id, the id it last checked in under (`previousSessionId`). It never reads or sends what you write in the conversation. A conversation gets wake-ups only after it is connected and named, and End live session on the agent's card disconnects it. The answer is yes or no.
 
 ## Before you install
 
@@ -45,6 +45,7 @@ The other way too: **Rename** the session on its card in Dashera and this conver
 
 ## What's new
 
+- **0.3.0:** a connected conversation stays the same live session when it goes on under a new id (the Claude app restarting, a resume): each check reads the conversation's id again, and when it changed it also sends the id this conversation last checked in under while connected (`previousSessionId`, kept in the plugin's own store per folder, never content). Dashera keeps the session's code, name and assignments, so it never shows two codes for one conversation. A `/clear` starts a new conversation and carries nothing over. After updating, quit and reopen the Claude app (or start a new `claude` session).
 - **0.2.15:** each check also sends the plugin's own version, so Dashera can show on the agent's card when a session's heartbeat is out of date (and the agent can tell you). A conversation whose live session was ended (by itself, or with End live session on the agent's card) stops checking until the next message you send in it; it connects again only when you paste the connect prompt from the card. After updating, quit and reopen the Claude app (or start a new `claude` session).
 - **0.2.14:** session names follow the conversation's title, both ways (see above). Each check may carry `title`; the answer carries `name` and `nameSource`. After updating, quit and reopen the Claude app (or start a new `claude` session) so the new version loads: a plugin's code is read when a session starts.
 - **0.2.13:** a failed check never stops sending this conversation's id.

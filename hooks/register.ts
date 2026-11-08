@@ -13,6 +13,20 @@ import { PLUGIN_VERSION } from './version'
 // and a conversation whose live session was ended stops checking until its
 // next prompt (the connect prompt brings it back).
 //
+// Session continuity (0.3.0, Julian, 8 Nov 2026): a conversation can go on
+// under a new Claude Code session id (a resume, the Claude app restarting;
+// the engine says so itself: "after a /clear or a resume the process goes on
+// under another" id, and no session.start fires for it). The plugin read
+// the id once, at session.start, and kept checking under the stale one, so
+// Dashera saw a new, unconnected conversation and let the connected session
+// lapse. Now every check reads the id again, and when it changed the check
+// names the id this conversation last checked in under while connected
+// (previousSessionId): Dashera keeps it the same live session, with its
+// code, name and assignments. That id is also kept in the plugin's own
+// store per folder, so a conversation resumed in a new process (the app
+// restarted) names it too. A /clear starts a new conversation: nothing is
+// carried over.
+//
 // Rename sync (0.2.14, Julian, 7 Nov 2026): the check also carries this
 // conversation's title when it changed, read from the tail of the
 // conversation's transcript (never its content), so the session's name in
@@ -119,6 +133,50 @@ export function titleFromDashera(
   return name && name !== title ? name : null
 }
 
+// ---- Session continuity (0.3.0) ----
+/** The plugin store's key: the last connected id per working folder. */
+export const CONTINUITY_KEY = 'continuity'
+/** A stored id is offered for this long after its last check. */
+export const CONTINUITY_MAX_AGE_MS = 6 * 3600_000
+/** previousSessionId goes with checks until connected, at most this long. */
+export const PREVIOUS_SEND_MS = 10 * 60_000
+/** At most this many folders are remembered. */
+const CONTINUITY_FOLDERS = 50
+
+export type ContinuityStore = Record<string, { id: string; at: number }>
+
+/** The store's value, cleaned: only well-formed entries. */
+export function continuityOf(raw: unknown): ContinuityStore {
+  const out: ContinuityStore = {}
+  if (!raw || typeof raw !== 'object') return out
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    const e = v as { id?: unknown; at?: unknown }
+    if (e && typeof e.id === 'string' && e.id && typeof e.at === 'number') out[k] = { id: e.id, at: e.at }
+  }
+  return out
+}
+
+/** The store with this folder's connected id set; the oldest folders dropped. */
+export function rememberConnected(store: ContinuityStore, cwd: string, id: string, at: number): ContinuityStore {
+  const next: ContinuityStore = { ...store, [cwd]: { id, at } }
+  const keys = Object.keys(next).sort((a, b) => next[b]!.at - next[a]!.at)
+  for (const k of keys.slice(CONTINUITY_FOLDERS)) delete next[k]
+  return next
+}
+
+/**
+ * The id a conversation resumed in a new process continues: the one its
+ * folder last checked in under while connected, recent, and not its own.
+ */
+export function resumedFrom(store: ContinuityStore, cwd: string, id: string, now: number): string | null {
+  const e = store[cwd]
+  if (!e || e.id === id || now - e.at > CONTINUITY_MAX_AGE_MS) return null
+  return e.id
+}
+
+/** Whether this Dashera takes previousSessionId (its tool list says so). */
+export const takesPrevious = (t: { description: string }) => /previousSessionId/.test(t.description)
+
 // Connectors added from claude.ai are named by an id
 // (mcp__618e79f2-...__wake_status), so the tool is found by its own name,
 // and among several by the one whose description says Dashera.
@@ -223,6 +281,14 @@ export const register: Register = on => {
   let pendingTitle: string | null = null
   // Ended (0.2.15): no checks until a prompt arrives in this conversation.
   let endedPause = false
+  // Continuity (0.3.0): the id this conversation last checked in under while
+  // connected; the one to send as previousSessionId, and since when; how the
+  // last session ended (a /clear carries nothing over); a resume at start.
+  let connectedId: string | null = null
+  let previousId: string | null = null
+  let previousSince = 0
+  let endedBy: string | null = null
+  let resumed = false
 
   // The owner renamed the session in Dashera: the conversation takes that
   // name at the next prompt Claude Code allows a title on (a wake-up's
@@ -241,9 +307,22 @@ export const register: Register = on => {
   }).catch(
     ($, e, next) => next(e),
   )
-  on('classic.SessionStart', async ($, e, next) => followDashera(await next(e))).catch(
-    ($, e, next) => next(e),
-  )
+  on('classic.SessionStart', async ($, e, next) => {
+    // A resumed conversation (continuity): it may go on under a new id.
+    const source = (e as { source?: string }).source
+    if (source === 'resume' || source === 'compact') resumed = true
+    return followDashera(await next(e))
+  }).catch(($, e, next) => next(e))
+  // The session this process ran ends: a /clear starts a new conversation
+  // (nothing carried over); a resume goes on under another id.
+  on('session.end', async ($, e, next) => {
+    endedBy = (e as { reason?: string }).reason ?? null
+    if (endedBy === 'clear') {
+      connectedId = null
+      previousId = null
+    }
+    return next(e)
+  }).catch(($, e, next) => next(e))
 
   // Only this plugin's own yes/no question goes through without a dialog;
   // the model's calls and every other tool are decided as before.
@@ -376,6 +455,7 @@ export const register: Register = on => {
       if (found) title = found
     }
     let sendWhere = true
+    let rememberedAt = Number.NEGATIVE_INFINITY
     let whereDroppedAt = 0
     let waitedForId = 0
     const tick = async () => {
@@ -393,6 +473,33 @@ export const register: Register = on => {
       polling = true
       try {
         const at = await $.clock.now()
+        // Continuity: the id now (a resume or a /clear changes it, and no
+        // session.start says so). A changed one names the id it continues.
+        const idNow = await within($.session.id(), 2000)
+        if (idNow && where.sessionId && idNow !== where.sessionId) {
+          const from = connectedId ?? where.sessionId
+          if (endedBy !== 'clear' && from !== idNow) {
+            previousId = from
+            previousSince = at
+          }
+          endedBy = null
+          where.sessionId = idNow
+          transcript = null
+          titleReadAt = Number.NEGATIVE_INFINITY
+          lastSentTitle = null
+          sessionCode = null
+        }
+        // Resumed in a new process: the id this folder last connected under.
+        if (resumed && !previousId && where.sessionId && cwdFull) {
+          resumed = false
+          const store = continuityOf(await within($.store.get(CONTINUITY_KEY), 2000))
+          const from = resumedFrom(store, cwdFull, where.sessionId, Date.now())
+          if (from) {
+            previousId = from
+            previousSince = at
+          }
+        }
+        if (previousId && at - previousSince > PREVIOUS_SEND_MS) previousId = null
         if (at - titleReadAt >= TITLE_REFRESH_MS) {
           titleReadAt = at
           await readTitle()
@@ -447,9 +554,16 @@ export const register: Register = on => {
         const sending = titleToSend(title, lastSentTitle)
         const extra = sendWhere ? { ...where, ...(sending ? { title: sending } : {}) } : {}
         for (const t of found) {
-          let reply = await askWithin(t.name, extra)
-          let withDetails = sendWhere
+          // Continuity: only to a Dashera whose tool takes it (an older tool
+          // list refuses an unknown field), and never instead of the rest.
+          const prev = sendWhere && previousId && takesPrevious(t) ? previousId : null
+          let reply = await askWithin(t.name, prev ? { ...extra, previousSessionId: prev } : extra)
           if (reply === TIMED_OUT) return
+          if (prev && (reply.failed || !parse(reply.text))) {
+            reply = await askWithin(t.name, extra)
+            if (reply === TIMED_OUT) return
+          }
+          let withDetails = sendWhere
           // A session whose connector loaded its tool list before Dashera took
           // session details refuses the extra fields: ask plainly from now on.
           if (sendWhere && (reply.failed || !parse(reply.text))) {
@@ -494,6 +608,23 @@ export const register: Register = on => {
         }
         // Older Dashera (one live session) may still say standingBy.
         sessionCode = answer.session?.code ?? null
+        // Continuity: connected under this id now. Remember it (here and in
+        // the plugin's store, per folder) so a later id can name it.
+        if (answer.connected !== false && answer.session?.code && where.sessionId) {
+          previousId = null
+          if (connectedId !== where.sessionId || at - rememberedAt > 10 * 60_000) {
+            connectedId = where.sessionId
+            rememberedAt = at
+            if (cwdFull) {
+              const id = where.sessionId
+              const folder = cwdFull
+              void (async () => {
+                const store = continuityOf(await within($.store.get(CONTINUITY_KEY), 2000))
+                await within($.store.set(CONTINUITY_KEY, rememberConnected(store, folder, id, Date.now())), 2000)
+              })()
+            }
+          }
+        }
         // Renamed on its card in Dashera: this conversation takes the name
         // at its next prompt.
         const fromDashera = titleFromDashera(answer, title)
