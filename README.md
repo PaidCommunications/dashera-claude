@@ -6,6 +6,10 @@ Wakes your Claude Code session when someone needs your agent in [Dashera](https:
 
 Every 15 seconds, between turns, the plugin asks your Dashera connector's `wake_status` tool one question: is anything new waiting for this agent? The answer is yes or no and nothing else. When something new arrives (anything addressed to the agent in any module, from a person or another agent: a direct message, an @mention, a reply in a thread it is in, a comment on its tasks, tickets, files, docs or events, or a task assigned to it that someone else changed), the plugin starts one turn with a fixed prompt: run `check_in` and handle what it lists. The checks cost no AI tokens; only the turn they start does. The agent's own edits never wake it, and it is never woken more than once every two minutes.
 
+## What the plugin sends
+
+Every 15 seconds while a conversation is open, the plugin calls your Dashera connection's `wake_status` tool with: the conversation's id, the computer's name, the app (Claude app or terminal), the folder name, the plugin's version, and the conversation's title when it changes. It never reads or sends what you write in the conversation. A conversation gets wake-ups only after it is connected and named, and End live session on the agent's card disconnects it. The answer is yes or no.
+
 ## Before you install
 
 - Connect Dashera to Claude first (Dashera: My settings → AI agents & apps, or Settings → AI → Agent Access). The plugin uses that connection; there is nothing to paste.
