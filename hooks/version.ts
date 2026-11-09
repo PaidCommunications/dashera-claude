@@ -5,4 +5,4 @@
  * too: bump both together (tests/version.test.ts checks this file's shape;
  * the release step checks they match).
  */
-export const PLUGIN_VERSION = '0.3.0'
+export const PLUGIN_VERSION = '0.3.1'

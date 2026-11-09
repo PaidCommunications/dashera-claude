@@ -22,10 +22,20 @@ import { PLUGIN_VERSION } from './version'
 // lapse. Now every check reads the id again, and when it changed the check
 // names the id this conversation last checked in under while connected
 // (previousSessionId): Dashera keeps it the same live session, with its
-// code, name and assignments. That id is also kept in the plugin's own
-// store per folder, so a conversation resumed in a new process (the app
-// restarted) names it too. A /clear starts a new conversation: nothing is
-// carried over.
+// code, name and assignments. A /clear starts a new conversation: nothing
+// is carried over.
+//
+// One conversation, one session (0.3.1, B16, 9 Nov 2026): 0.3.0 also kept
+// the last connected id per folder and had a conversation resumed in a new
+// process name it. Several conversations share a folder (the Mac Studio's
+// "Humboldt Gardens Operations" holds Dashera Builder, CRM, Milo Games and
+// more), so a resumed conversation could name another one's id and take
+// its session. Now the store keeps connected conversation ids, never
+// folders, and a resumed conversation names a previous id only when its
+// own transcript shows it continues that conversation. Each copy of the
+// plugin also names itself (instance), so when two copies check in for one
+// conversation (an old copy for a while after the plugin updates) Dashera
+// wakes only the newest.
 //
 // Rename sync (0.2.14, Julian, 7 Nov 2026): the check also carries this
 // conversation's title when it changed, read from the tail of the
@@ -133,46 +143,78 @@ export function titleFromDashera(
   return name && name !== title ? name : null
 }
 
-// ---- Session continuity (0.3.0) ----
-/** The plugin store's key: the last connected id per working folder. */
-export const CONTINUITY_KEY = 'continuity'
+// ---- Session continuity (0.3.0; per conversation since 0.3.1) ----
+/** The plugin store's key: connected conversation ids (0.3.1 on). */
+export const CONVERSATIONS_KEY = 'conversations'
+/** 0.3.0's key, one id per folder: never read, cleared once. */
+export const LEGACY_CONTINUITY_KEY = 'continuity'
 /** A stored id is offered for this long after its last check. */
 export const CONTINUITY_MAX_AGE_MS = 6 * 3600_000
 /** previousSessionId goes with checks until connected, at most this long. */
 export const PREVIOUS_SEND_MS = 10 * 60_000
-/** At most this many folders are remembered. */
-const CONTINUITY_FOLDERS = 50
+/** At most this many conversations are remembered. */
+const CONTINUITY_CONVERSATIONS = 200
+/** How much of a resumed transcript's start is read for the ids it continues. */
+export const RESUME_HEAD_BYTES = 256 * 1024
 
-export type ContinuityStore = Record<string, { id: string; at: number }>
+/** Connected conversation ids and when each last checked in connected. */
+export type ConversationStore = Record<string, { at: number }>
 
-/** The store's value, cleaned: only well-formed entries. */
-export function continuityOf(raw: unknown): ContinuityStore {
-  const out: ContinuityStore = {}
+/** The store's value, cleaned: only well-formed entries (never a folder). */
+export function conversationsOf(raw: unknown): ConversationStore {
+  const out: ConversationStore = {}
   if (!raw || typeof raw !== 'object') return out
   for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
-    const e = v as { id?: unknown; at?: unknown }
-    if (e && typeof e.id === 'string' && e.id && typeof e.at === 'number') out[k] = { id: e.id, at: e.at }
+    const e = v as { at?: unknown }
+    if (k && !k.includes('/') && e && typeof e.at === 'number') out[k] = { at: e.at }
   }
   return out
 }
 
-/** The store with this folder's connected id set; the oldest folders dropped. */
-export function rememberConnected(store: ContinuityStore, cwd: string, id: string, at: number): ContinuityStore {
-  const next: ContinuityStore = { ...store, [cwd]: { id, at } }
+/** The store with this conversation's id remembered; the oldest dropped. */
+export function rememberConversation(store: ConversationStore, id: string, at: number): ConversationStore {
+  const next: ConversationStore = { ...store, [id]: { at } }
   const keys = Object.keys(next).sort((a, b) => next[b]!.at - next[a]!.at)
-  for (const k of keys.slice(CONTINUITY_FOLDERS)) delete next[k]
+  for (const k of keys.slice(CONTINUITY_CONVERSATIONS)) delete next[k]
   return next
 }
 
 /**
- * The id a conversation resumed in a new process continues: the one its
- * folder last checked in under while connected, recent, and not its own.
+ * The session ids a transcript's lines carry, in order, each once. A
+ * conversation resumed under a new id starts its transcript with the
+ * earlier messages, which keep the ids they were written under.
  */
-export function resumedFrom(store: ContinuityStore, cwd: string, id: string, now: number): string | null {
-  const e = store[cwd]
-  if (!e || e.id === id || now - e.at > CONTINUITY_MAX_AGE_MS) return null
-  return e.id
+export function transcriptSessionIds(head: string): string[] {
+  const seen: string[] = []
+  for (const m of head.matchAll(/"sessionId"\s*:\s*"([^"\\]{1,200})"/g)) {
+    const id = m[1]!
+    if (!seen.includes(id)) seen.push(id)
+  }
+  return seen
 }
+
+/**
+ * The id a conversation resumed in a new process continues: the latest id
+ * its own transcript was written under that checked in connected, recently,
+ * and isn't its own. Never another conversation's: a shared folder says
+ * nothing about which conversation this is.
+ */
+export function resumedFrom(store: ConversationStore, ownIds: string[], id: string, now: number): string | null {
+  for (let i = ownIds.length - 1; i >= 0; i--) {
+    const prev = ownIds[i]!
+    const e = store[prev]
+    if (prev !== id && e && now - e.at <= CONTINUITY_MAX_AGE_MS) return prev
+  }
+  return null
+}
+
+/** A random id for this copy of the plugin (new each time it loads). */
+export function newInstanceId(): string {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+}
+
+/** Whether this Dashera tells plugin copies apart (its tool list says so). */
+export const takesInstance = (t: { description: string }) => /\binstance\b/.test(t.description)
 
 /** Whether this Dashera takes previousSessionId (its tool list says so). */
 export const takesPrevious = (t: { description: string }) => /previousSessionId/.test(t.description)
@@ -288,7 +330,12 @@ export const register: Register = on => {
   let previousId: string | null = null
   let previousSince = 0
   let endedBy: string | null = null
+  // A resume in a new process (0.3.1): its transcript, read once for the
+  // ids it continues.
   let resumed = false
+  let resumedTranscript: string | null = null
+  // This copy of the plugin (0.3.1): Dashera wakes only the newest copy.
+  const instance = newInstanceId()
 
   // The owner renamed the session in Dashera: the conversation takes that
   // name at the next prompt Claude Code allows a title on (a wake-up's
@@ -309,8 +356,12 @@ export const register: Register = on => {
   )
   on('classic.SessionStart', async ($, e, next) => {
     // A resumed conversation (continuity): it may go on under a new id.
-    const source = (e as { source?: string }).source
-    if (source === 'resume' || source === 'compact') resumed = true
+    // Only a resume: a compact keeps the id, a fork is a new conversation.
+    const c = e as { source?: string; transcript_path?: string }
+    if (c.source === 'resume') {
+      resumed = true
+      if (typeof c.transcript_path === 'string' && c.transcript_path) resumedTranscript = c.transcript_path
+    }
     return followDashera(await next(e))
   }).catch(($, e, next) => next(e))
   // The session this process ran ends: a /clear starts a new conversation
@@ -489,14 +540,25 @@ export const register: Register = on => {
           lastSentTitle = null
           sessionCode = null
         }
-        // Resumed in a new process: the id this folder last connected under.
-        if (resumed && !previousId && where.sessionId && cwdFull) {
+        // Resumed in a new process: the id this conversation itself last
+        // connected under, read from its own transcript. Never the folder's.
+        if (resumed && !previousId && where.sessionId) {
           resumed = false
-          const store = continuityOf(await within($.store.get(CONTINUITY_KEY), 2000))
-          const from = resumedFrom(store, cwdFull, where.sessionId, Date.now())
-          if (from) {
-            previousId = from
-            previousSince = at
+          const path = resumedTranscript ?? (await findTranscript())
+          const head = path
+            ? await within(
+                $.process.run(['head', '-c', String(RESUME_HEAD_BYTES), path], { timeoutMs: 3000 }),
+                4000,
+              )
+            : undefined
+          const ids = head && head.exitCode === 0 ? transcriptSessionIds(head.stdout) : []
+          if (ids.some(x => x !== where.sessionId)) {
+            const store = conversationsOf(await within($.store.get(CONVERSATIONS_KEY), 2000))
+            const from = resumedFrom(store, ids, where.sessionId, Date.now())
+            if (from) {
+              previousId = from
+              previousSince = at
+            }
           }
         }
         if (previousId && at - previousSince > PREVIOUS_SEND_MS) previousId = null
@@ -557,10 +619,12 @@ export const register: Register = on => {
           // Continuity: only to a Dashera whose tool takes it (an older tool
           // list refuses an unknown field), and never instead of the rest.
           const prev = sendWhere && previousId && takesPrevious(t) ? previousId : null
-          let reply = await askWithin(t.name, prev ? { ...extra, previousSessionId: prev } : extra)
+          // Which copy asks, only to a Dashera that takes it (0.3.1).
+          const base = sendWhere && takesInstance(t) ? { ...extra, instance } : extra
+          let reply = await askWithin(t.name, prev ? { ...base, previousSessionId: prev } : base)
           if (reply === TIMED_OUT) return
           if (prev && (reply.failed || !parse(reply.text))) {
-            reply = await askWithin(t.name, extra)
+            reply = await askWithin(t.name, base)
             if (reply === TIMED_OUT) return
           }
           let withDetails = sendWhere
@@ -609,20 +673,22 @@ export const register: Register = on => {
         // Older Dashera (one live session) may still say standingBy.
         sessionCode = answer.session?.code ?? null
         // Continuity: connected under this id now. Remember it (here and in
-        // the plugin's store, per folder) so a later id can name it.
+        // the plugin's store, per conversation id) so a later id can name it.
         if (answer.connected !== false && answer.session?.code && where.sessionId) {
           previousId = null
           if (connectedId !== where.sessionId || at - rememberedAt > 10 * 60_000) {
             connectedId = where.sessionId
             rememberedAt = at
-            if (cwdFull) {
-              const id = where.sessionId
-              const folder = cwdFull
-              void (async () => {
-                const store = continuityOf(await within($.store.get(CONTINUITY_KEY), 2000))
-                await within($.store.set(CONTINUITY_KEY, rememberConnected(store, folder, id, Date.now())), 2000)
-              })()
-            }
+            const id = where.sessionId
+            void (async () => {
+              const store = conversationsOf(await within($.store.get(CONVERSATIONS_KEY), 2000))
+              await within($.store.set(CONVERSATIONS_KEY, rememberConversation(store, id, Date.now())), 2000)
+              // 0.3.0's per-folder ids are never read again: cleared.
+              const legacy = await within($.store.get(LEGACY_CONTINUITY_KEY), 2000)
+              if (legacy && typeof legacy === 'object' && Object.keys(legacy).length > 0) {
+                await within($.store.set(LEGACY_CONTINUITY_KEY, {}), 2000)
+              }
+            })()
           }
         }
         // Renamed on its card in Dashera: this conversation takes the name
