@@ -37,6 +37,11 @@ import { PLUGIN_VERSION } from './version'
 // conversation (an old copy for a while after the plugin updates) Dashera
 // wakes only the newest.
 //
+// One wake-up per burst (0.3.2, 11 Nov 2026): the first new item starts a
+// 20-second wait and the whole burst gets one wake-up, whose prompt is
+// exactly "New activity in Dashera: <org>". Only what addresses this session
+// counts; Dashera leaves quiet posts out of the answer.
+//
 // Rename sync (0.2.14, Julian, 7 Nov 2026): the check also carries this
 // conversation's title when it changed, read from the tail of the
 // conversation's transcript (never its content), so the session's name in
@@ -45,35 +50,25 @@ import { PLUGIN_VERSION } from './version'
 // either way.
 
 /**
- * The turn a wake-up starts. The first in a session reads everything; later
- * ones are one line naming where (Julian, 2 Nov 2026: each wake-up re-read
- * the whole playbook and rules, about 10 KB, in every organization). The
- * Dashera connector's own instructions say what that line means too, so it
- * holds after the conversation is summarized.
+ * The turn a wake-up starts: exactly "New activity in Dashera: <org>", every
+ * time (0.3.2, Julian, 11 Nov 2026). Claude Code adds its own framing around
+ * it; the plugin adds nothing. The Dashera connector's own instructions say
+ * what the line means (run check_in, handle it, advance_cursor), and the
+ * plugin fills in this session's code on those calls itself.
  */
-export function wakePrompt(
-  first: boolean,
-  organizations?: string[],
-  session?: string | null,
-): string {
+export function wakePrompt(organizations?: string[]): string {
   const orgs = (organizations ?? []).filter(Boolean)
-  const where = orgs.length > 0 ? `: ${orgs.join(', ')}` : ''
-  // Later wake-ups are one line (Julian, 2 Nov 2026); the first one says
-  // what that line means for the rest of the session. The session code is
-  // given once: the plugin fills it in on later calls itself.
-  if (!first) return `New activity in Dashera${where}.`
-  const lead =
-    orgs.length > 0
-      ? `Live on Dashera: something new is waiting for you in ${orgs.join(' and ')}.`
-      : 'Live on Dashera: something new is waiting for you.'
-  const pass = session
-    ? ` This session's code is ${session}: pass session: "${session}" to check_in, advance_cursor and name_my_session, so it reads and marks only its own items.`
-    : ''
-  return `${lead} Run check_in (naming the organization if you work in more than one), handle what it lists, then call advance_cursor.${pass} Later wake-ups only say "New activity in Dashera" and where: do the same for each organization named.`
+  return orgs.length > 0 ? `New activity in Dashera: ${orgs.join(', ')}` : 'New activity in Dashera'
 }
 const POLL_MS = 15_000
 // Never two wake-ups closer than this, however busy Dashera gets.
-const MIN_GAP_MS = 2 * 60_000
+export const MIN_GAP_MS = 2 * 60_000
+/**
+ * Debounce (0.3.2, 11 Nov 2026): the first new addressed item starts a wait
+ * this long, and the whole burst gets one wake-up when it ends (4 posts in
+ * 3 minutes had woken a session 4 times, about 4 calls each).
+ */
+export const WAKE_DEBOUNCE_MS = 20_000
 
 // ---- Rename sync (0.2.14) ----
 /** A session name in Dashera is at most this long. */
@@ -313,7 +308,12 @@ export const register: Register = on => {
   let polling = false
   let lastGood: string | undefined
   let askedForRule = false
-  let woken = false
+  // Debounce (0.3.2): a burst under way, its newest marker, the
+  // organizations it touched, and whether the last answer still had work.
+  let burst = false
+  let burstMarker: string | null = null
+  const burstOrgs: string[] = []
+  let stillPending = false
   let sessionCode: string | null = null
   // Rename sync (0.2.14): this conversation's title as its transcript last
   // said, the title last sent to Dashera, and a name the owner gave the
@@ -405,6 +405,9 @@ export const register: Register = on => {
 
   on('session.start', async ($, e, next) => {
     const started = await next(e)
+    // A burst's timer from an earlier start may be gone: start clean (a
+    // late one still wakes at most once per marker).
+    burst = false
     // Where this session runs, for the agent's card in Dashera: the
     // computer, the app and the folder. Never content. Gathered in the
     // background with a time limit each, so nothing here can ever hold up
@@ -504,6 +507,17 @@ export const register: Register = on => {
       if (text === null) return
       const found = lastCustomTitle(text)
       if (found) title = found
+    }
+    // The burst's wait ended: one wake-up for all of it, unless the work was
+    // handled meanwhile or the session ended.
+    const wakeForBurst = async () => {
+      burst = false
+      const orgs = burstOrgs.splice(0)
+      if (!stillPending || endedPause || !burstMarker || burstMarker === lastMarker) return
+      lastMarker = burstMarker
+      lastWakeAt = await $.clock.now()
+      // Queued: it starts its own turn once the session is idle.
+      void $.prompt.submit({ text: wakePrompt(orgs) }).catch(() => {})
     }
     let sendWhere = true
     let rememberedAt = Number.NEGATIVE_INFINITY
@@ -705,19 +719,20 @@ export const register: Register = on => {
               ? `Dashera: new work waiting${label}`
               : `Live on Dashera${label}`,
         )
-        const now = await $.clock.now()
-        if (
-          answer.pending &&
-          answer.marker &&
-          answer.marker !== lastMarker &&
-          now - lastWakeAt >= MIN_GAP_MS
-        ) {
-          lastMarker = answer.marker
-          lastWakeAt = now
-          // Queued: it starts its own turn once the session is idle.
-          const text = wakePrompt(!woken, answer.organizations, answer.session?.code)
-          woken = true
-          void $.prompt.submit({ text }).catch(() => {})
+        // Only addressed items make an answer pending: Dashera leaves out
+        // what addresses another session, and quiet posts (listed at
+        // check_in, they wake nobody).
+        stillPending = answer.pending === true && !answer.standingBy && answer.connected !== false
+        if (stillPending && answer.marker && answer.marker !== lastMarker) {
+          burstMarker = answer.marker
+          for (const o of answer.organizations ?? []) if (o && !burstOrgs.includes(o)) burstOrgs.push(o)
+          if (!burst) {
+            burst = true
+            const now = await $.clock.now()
+            // Wait out the burst, and never closer than MIN_GAP_MS to the last.
+            const wait = Math.max(WAKE_DEBOUNCE_MS, lastWakeAt + MIN_GAP_MS - now)
+            $.clock.after(wait, () => void wakeForBurst())
+          }
         }
       } catch {
         // The connector may be reconnecting; the next tick tries again.

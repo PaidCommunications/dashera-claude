@@ -18,7 +18,7 @@ const setup = (on: Parameters<Parameters<typeof test>[1]>[1]) => {
 
 test('the version is a plain dotted number', () => {
   expect(PLUGIN_VERSION).toMatch(/^\d+\.\d+\.\d+$/)
-  expect(PLUGIN_VERSION).toBe('0.3.1')
+  expect(PLUGIN_VERSION).toBe('0.3.2')
 })
 
 test('sends its own version with every check, beside the conversation id', async ($, on) => {

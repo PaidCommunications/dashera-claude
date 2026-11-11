@@ -36,9 +36,9 @@ test('wakes once per new marker, never more often than every two minutes', async
   expect(prompts).toHaveLength(0)
 
   answer = { pending: true, marker: 'a1' }
-  await clock.advance(30_000)
+  await clock.advance(45_000)
   expect(prompts).toHaveLength(1)
-  expect(prompts[0]).toContain('check_in')
+  expect(prompts[0]).toBe('New activity in Dashera')
 
   // The same marker never wakes it again.
   await clock.advance(5 * 30_000)
@@ -46,7 +46,7 @@ test('wakes once per new marker, never more often than every two minutes', async
 
   // A new marker does, once two minutes have passed since the last wake.
   answer = { pending: true, marker: 'b2' }
-  await clock.advance(30_000)
+  await clock.advance(45_000)
   expect(prompts).toHaveLength(2)
 })
 
@@ -87,7 +87,7 @@ test('finds Dashera under a connector named by an id', async ($, on) => {
     return { text: e.text }
   })
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
-  await clock.advance(6_000)
+  await clock.advance(6_000 + 20_000)
   expect(prompts).toHaveLength(1)
 })
 
@@ -113,7 +113,7 @@ test('still checks when an older connector refuses the session details', async (
     return { text: e.text }
   })
   await $.session.start({ cwd: '/x/proj', surface: 'desktop', isInteractive: true })
-  await clock.advance(6_000)
+  await clock.advance(6_000 + 20_000)
   expect(prompts).toHaveLength(1)
 })
 
@@ -143,7 +143,7 @@ test('asks the connector directly first', async ($, on) => {
     return { text: e.text }
   })
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
-  await clock.advance(6_000)
+  await clock.advance(6_000 + 20_000)
   expect(servers[0]).toBe('618e79f2-adbe-49a0-a83c-37cbf0b55c46')
   expect(prompts).toHaveLength(1)
 })
@@ -201,7 +201,7 @@ test('with two Dashera connectors, uses the one a permission rule allows', async
     return { text: e.text }
   })
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
-  await clock.advance(6_000)
+  await clock.advance(6_000 + 20_000)
   expect(prompts).toHaveLength(1)
   // Next time it asks the one that answered first.
   asked.length = 0
@@ -257,14 +257,12 @@ test("doesn't ask for a rule when the connector itself refuses", async ($, on) =
   expect(prompts).toHaveLength(0)
 })
 
-test('the first wake-up reads everything; later ones are one line naming where', () => {
-  const first = wakePrompt(true, ['Example Org'])
-  expect(first).toContain('Example Org')
-  expect(first).toContain('New activity in Dashera')
-  expect(wakePrompt(false, ['Example Org'])).toBe('New activity in Dashera: Example Org.')
+test('the wake-up prompt is exactly "New activity in Dashera: <org>" (0.3.2)', () => {
+  expect(wakePrompt(['Example Org'])).toBe('New activity in Dashera: Example Org')
+  expect(wakePrompt(['Example Org', 'Other Org'])).toBe('New activity in Dashera: Example Org, Other Org')
   // An older Dashera that doesn't say where.
-  expect(wakePrompt(false)).toBe('New activity in Dashera.')
-  expect(wakePrompt(true)).toContain('naming the organization')
+  expect(wakePrompt()).toBe('New activity in Dashera')
+  expect(wakePrompt([])).toBe('New activity in Dashera')
 })
 
 test('stands by, and says so, while a newer session of the agent is live', async ($, on) => {
@@ -290,17 +288,6 @@ test('stands by, and says so, while a newer session of the agent is live', async
   await clock.advance(36_000)
   expect(prompts).toHaveLength(0)
   expect(statuses).toContain('Live on Dashera: standing by (a newer session is live)')
-})
-
-test('names its session code in the first wake-up only; later ones stay one short line', () => {
-  const first = wakePrompt(true, ['Example Org'], 'S-3F9A2C')
-  expect(first).toContain('session: "S-3F9A2C"')
-  // The plugin fills the code in on later calls itself (Julian, 2 Nov 2026).
-  expect(wakePrompt(false, ['Example Org'], 'S-3F9A2C')).toBe(
-    'New activity in Dashera: Example Org.',
-  )
-  // An older Dashera that gives no code: as before.
-  expect(wakePrompt(false, ['Example Org'])).toBe('New activity in Dashera: Example Org.')
 })
 
 async function liveWithCode($: Parameters<Parameters<typeof test>[1]>[0], on: Parameters<Parameters<typeof test>[1]>[1]) {
