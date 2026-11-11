@@ -94,3 +94,26 @@ test('work handled before the wait ends wakes nothing', async ($, on) => {
   await clock.advance(60_000)
   expect(prompts).toHaveLength(0)
 })
+
+test("the first wake's prompt has no session code; check_in and advance_cursor still carry it", async ($, on) => {
+  const seen: { tool: string; session: unknown }[] = []
+  for (const tool of ['mcp__dashera__check_in', 'mcp__dashera__advance_cursor'] as const) {
+    on('tool.call', { tool }, (_, e) => {
+      seen.push({ tool, session: (e as unknown as Record<string, unknown>).session })
+      return { result: [{ type: 'text', text: '{}' }], text: '{}' }
+    })
+  }
+  const { clock, state, prompts } = await live($, on)
+  state.answer = { pending: true, marker: 'c1', organizations: ['Example Org'] }
+  await clock.advance(40_000)
+  // The very first wake-up is the short line, with no code in it.
+  expect(prompts).toEqual(['New activity in Dashera: Example Org'])
+  expect(prompts[0]).not.toContain('S-B0057A')
+  // The agent calls them as the line leaves it, without a code.
+  await $.tool.call({ tool: 'mcp__dashera__check_in', organization: 'Example Org' } as never)
+  await $.tool.call({ tool: 'mcp__dashera__advance_cursor', organization: 'Example Org', position: 'x' } as never)
+  expect(seen).toEqual([
+    { tool: 'mcp__dashera__check_in', session: 'S-B0057A' },
+    { tool: 'mcp__dashera__advance_cursor', session: 'S-B0057A' },
+  ])
+})
