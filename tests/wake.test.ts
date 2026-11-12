@@ -11,7 +11,7 @@ const whereMocks = (on: Parameters<Parameters<typeof test>[1]>[1]) => {
   on('session.cwd', () => ({ value: '/w' }))
 }
 
-test('wakes once per new marker, never more often than every two minutes', async ($, on) => {
+test('wakes once per new marker, never closer than MIN_GAP_MS', async ($, on) => {
   const clock = mock.clock(on)
   whereMocks(on)
   let answer = { pending: false, marker: null as string | null }
@@ -44,7 +44,7 @@ test('wakes once per new marker, never more often than every two minutes', async
   await clock.advance(5 * 30_000)
   expect(prompts).toHaveLength(1)
 
-  // A new marker does, once two minutes have passed since the last wake.
+  // A new marker does, once MIN_GAP_MS has passed since the last wake.
   answer = { pending: true, marker: 'b2' }
   await clock.advance(45_000)
   expect(prompts).toHaveLength(2)

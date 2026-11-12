@@ -42,6 +42,18 @@ import { PLUGIN_VERSION } from './version'
 // exactly "New activity in Dashera: <org>". Only what addresses this session
 // counts; Dashera leaves quiet posts out of the answer.
 //
+// Wake-ups that arrive (0.3.3, 12 Nov 2026): a mention woke a busy session
+// 23 minutes late once and never another time (it was found 3h44m later).
+// 0.3.2 counted a wake as delivered the moment it asked for the prompt, and
+// ignored the answer: a submit the engine dropped, or one lost while the
+// session was in the middle of a turn, used up that item and nothing raised
+// it again. Now a wake is delivered only when its prompt enters; it waits
+// while the session runs a turn of its own and goes at the first idle check
+// after it (a turn that never reports its end holds it at most
+// STUCK_TURN_MS); and a burst gets its wake-up at most WAKE_MAX_WAIT_MS after
+// its first new item, however much keeps arriving (the 2-minute gap is now
+// 30 seconds).
+//
 // Rename sync (0.2.14, Julian, 7 Nov 2026): the check also carries this
 // conversation's title when it changed, read from the tail of the
 // conversation's transcript (never its content), so the session's name in
@@ -61,14 +73,29 @@ export function wakePrompt(organizations?: string[]): string {
   return orgs.length > 0 ? `New activity in Dashera: ${orgs.join(', ')}` : 'New activity in Dashera'
 }
 const POLL_MS = 15_000
-// Never two wake-ups closer than this, however busy Dashera gets.
-export const MIN_GAP_MS = 2 * 60_000
+// Never two wake-ups closer than this, however busy Dashera gets (2 minutes
+// until 0.3.3, which held a new item up to 2 minutes behind the last wake).
+export const MIN_GAP_MS = 30_000
 /**
  * Debounce (0.3.2, 11 Nov 2026): the first new addressed item starts a wait
  * this long, and the whole burst gets one wake-up when it ends (4 posts in
  * 3 minutes had woken a session 4 times, about 4 calls each).
  */
 export const WAKE_DEBOUNCE_MS = 20_000
+/**
+ * The hard limit (0.3.3): a burst's wake-up is due at most this long after
+ * the first new item the plugin saw, whatever arrives after it.
+ */
+export const WAKE_MAX_WAIT_MS = 30_000
+/**
+ * A wake-up waits while the session runs a turn of its own (0.3.3), but a
+ * turn that never reported its end holds it no longer than this.
+ */
+export const STUCK_TURN_MS = 30 * 60_000
+/** A wake-up the engine dropped is asked again no sooner than this. */
+export const RETRY_DROPPED_MS = 30_000
+/** How long a submit may take to answer before it counts as queued. */
+const SUBMIT_ANSWER_MS = 30_000
 
 // ---- Rename sync (0.2.14) ----
 /** A session name in Dashera is at most this long. */
@@ -336,6 +363,15 @@ export const register: Register = on => {
   let resumedTranscript: string | null = null
   // This copy of the plugin (0.3.1): Dashera wakes only the newest copy.
   const instance = newInstanceId()
+  // Delivery (0.3.3): the main loop's turns running now and since when; a
+  // wake-up whose wait ended and that hasn't entered yet; when a dropped one
+  // may be asked again; and the check to run when a turn ends.
+  const running = new Set<string>()
+  let runningSince = 0
+  let due: { marker: string; orgs: string[] } | null = null
+  let delivering = false
+  let retryAt = Number.NEGATIVE_INFINITY
+  let checkSoon: (() => void) | null = null
 
   // The owner renamed the session in Dashera: the conversation takes that
   // name at the next prompt Claude Code allows a title on (a wake-up's
@@ -354,6 +390,22 @@ export const register: Register = on => {
   }).catch(
     ($, e, next) => next(e),
   )
+  // The session's own turns (0.3.3): a wake-up waits for the main loop to be
+  // idle. A subagent's run is part of a turn the main loop already holds.
+  on('turn.start', async ($, e, next) => {
+    if (e.agentId === undefined) {
+      if (running.size === 0) runningSince = await $.clock.now()
+      running.add(e.turnId)
+    }
+    return next(e)
+  }).catch(($, e, next) => next(e))
+  on('turn.complete', async ($, e, next) => {
+    if (e.agentId === undefined && running.delete(e.turnId) && running.size === 0) {
+      // Idle again: check now rather than at the next tick.
+      checkSoon?.()
+    }
+    return next(e)
+  }).catch(($, e, next) => next(e))
   on('classic.SessionStart', async ($, e, next) => {
     // A resumed conversation (continuity): it may go on under a new id.
     // Only a resume: a compact keeps the id, a fork is a new conversation.
@@ -408,6 +460,7 @@ export const register: Register = on => {
     // A burst's timer from an earlier start may be gone: start clean (a
     // late one still wakes at most once per marker).
     burst = false
+    due = null
     // Where this session runs, for the agent's card in Dashera: the
     // computer, the app and the folder. Never content. Gathered in the
     // background with a time limit each, so nothing here can ever hold up
@@ -514,10 +567,43 @@ export const register: Register = on => {
       burst = false
       const orgs = burstOrgs.splice(0)
       if (!stillPending || endedPause || !burstMarker || burstMarker === lastMarker) return
-      lastMarker = burstMarker
-      lastWakeAt = await $.clock.now()
-      // Queued: it starts its own turn once the session is idle.
-      void $.prompt.submit({ text: wakePrompt(orgs) }).catch(() => {})
+      // Due until its prompt enters (0.3.3); a newer burst takes its place
+      // and keeps the organizations both touched.
+      const all = [...(due?.orgs ?? [])]
+      for (const o of orgs) if (!all.includes(o)) all.push(o)
+      due = { marker: burstMarker, orgs: all }
+      await deliver()
+    }
+    // A due wake-up starts its turn now, unless the session is running one
+    // of its own (then the first idle check sends it), or the engine dropped
+    // it a moment ago. Delivered only when the prompt entered.
+    const deliver = async () => {
+      if (!due || delivering || endedPause || !stillPending) return
+      const now = await $.clock.now()
+      if (running.size > 0 && now - runningSince < STUCK_TURN_MS) return
+      if (now < retryAt) return
+      const d = due
+      delivering = true
+      try {
+        const answer = await within(
+          $.prompt.submit({ text: wakePrompt(d.orgs) }).then(
+            r => ('drop' in r && r.drop !== undefined ? 'dropped' : 'entered'),
+            () => 'dropped' as const,
+          ),
+          SUBMIT_ANSWER_MS,
+        )
+        // No answer in time: it waits in the engine's queue, which runs it
+        // once the session is idle.
+        if (answer === 'dropped') {
+          retryAt = (await $.clock.now()) + RETRY_DROPPED_MS
+          return
+        }
+        lastMarker = d.marker
+        lastWakeAt = now
+        if (due === d) due = null
+      } finally {
+        delivering = false
+      }
     }
     let sendWhere = true
     let rememberedAt = Number.NEGATIVE_INFINITY
@@ -723,17 +809,26 @@ export const register: Register = on => {
         // what addresses another session, and quiet posts (listed at
         // check_in, they wake nobody).
         stillPending = answer.pending === true && !answer.standingBy && answer.connected !== false
+        // Handled meanwhile (the agent's own turn checked in): nothing is due.
+        if (!stillPending) due = null
         if (stillPending && answer.marker && answer.marker !== lastMarker) {
           burstMarker = answer.marker
           for (const o of answer.organizations ?? []) if (o && !burstOrgs.includes(o)) burstOrgs.push(o)
           if (!burst) {
             burst = true
             const now = await $.clock.now()
-            // Wait out the burst, and never closer than MIN_GAP_MS to the last.
-            const wait = Math.max(WAKE_DEBOUNCE_MS, lastWakeAt + MIN_GAP_MS - now)
+            // Wait out the burst, never closer than MIN_GAP_MS to the last
+            // wake, and never longer than WAKE_MAX_WAIT_MS from this, its
+            // first item: later items join it and never restart the wait.
+            const wait = Math.min(
+              WAKE_MAX_WAIT_MS,
+              Math.max(WAKE_DEBOUNCE_MS, lastWakeAt + MIN_GAP_MS - now),
+            )
             $.clock.after(wait, () => void wakeForBurst())
           }
         }
+        // A wake-up held by a turn, or dropped, goes now if it can.
+        if (due) await deliver()
       } catch {
         // The connector may be reconnecting; the next tick tries again.
       } finally {
@@ -742,6 +837,8 @@ export const register: Register = on => {
     }
     $.clock.every(POLL_MS, () => void tick())
     $.clock.after(5_000, () => void tick())
+    // A turn ended: check a second later, so a held wake-up goes at once.
+    checkSoon = () => $.clock.after(1_000, () => void tick())
     return started
   })
 }
