@@ -1,7 +1,7 @@
 import type { On } from 'claude-code'
 import type { Engine } from 'claude-code/testing'
 import { expect, mock, test } from 'claude-code/testing'
-import { MIN_GAP_MS, STUCK_TURN_MS, WAKE_MAX_WAIT_MS } from '../hooks/register'
+import { MIN_GAP_MS, STUCK_TURN_MS, WAKE_MAX_WAIT_MS, wakePrompt } from '../hooks/register'
 
 // 0.3.3 (12 Nov 2026): a mention that addressed a live session woke it 23
 // minutes late once and never another time (found 3h44m later). 0.3.2 marked
@@ -13,7 +13,7 @@ import { MIN_GAP_MS, STUCK_TURN_MS, WAKE_MAX_WAIT_MS } from '../hooks/register'
 // item of a burst.
 
 const TOOL = 'mcp__dashera__wake_status'
-type Answer = { pending: boolean; marker: string | null; organizations?: string[] }
+type Answer = { pending: boolean; marker: string | null; organizations?: string[]; organizationIds?: string[] }
 
 async function live($: Engine, on: On, opts: { drop?: () => boolean } = {}) {
   const clock = mock.clock(on)
@@ -44,7 +44,8 @@ async function live($: Engine, on: On, opts: { drop?: () => boolean } = {}) {
   return { clock, state, prompts, dropped }
 }
 
-const WAKE = 'New activity in Dashera: Example Org'
+const ORG = '0b6f4a1e-6d2c-4c1b-9f43-2a7d8e5b1c01'
+const WAKE = wakePrompt([ORG])
 
 test('a burst never waits more than 30 s from its first item', () => {
   expect(WAKE_MAX_WAIT_MS).toBe(30_000)
@@ -54,7 +55,7 @@ test('a burst never waits more than 30 s from its first item', () => {
 test('a dropped wake-up is not used up: it is asked again and enters', async ($, on) => {
   let drops = 1
   const { clock, state, prompts, dropped } = await live($, on, { drop: () => drops-- > 0 })
-  state.answer = { pending: true, marker: 'm1', organizations: ['Example Org'] }
+  state.answer = { pending: true, marker: 'm1', organizations: ['Example Org'], organizationIds: [ORG] }
   await clock.advance(45_000)
   expect(dropped).toEqual([WAKE])
   expect(prompts).toHaveLength(0)
@@ -69,7 +70,7 @@ test('a dropped wake-up is not used up: it is asked again and enters', async ($,
 test('a mention while the session is mid-turn wakes it at its next idle check', async ($, on) => {
   const { clock, state, prompts } = await live($, on)
   await $.turn.start({ text: 'build the thing', turnId: 'long-1' })
-  state.answer = { pending: true, marker: 'mt1', organizations: ['Example Org'] }
+  state.answer = { pending: true, marker: 'mt1', organizations: ['Example Org'], organizationIds: [ORG] }
   // A long turn: nothing is pushed into it.
   await clock.advance(10 * 60_000)
   expect(prompts).toHaveLength(0)
@@ -82,7 +83,7 @@ test('a mention while the session is mid-turn wakes it at its next idle check', 
 test('a mention the running turn handled itself wakes nothing after it', async ($, on) => {
   const { clock, state, prompts } = await live($, on)
   await $.turn.start({ text: 'working', turnId: 'long-2' })
-  state.answer = { pending: true, marker: 'mt2', organizations: ['Example Org'] }
+  state.answer = { pending: true, marker: 'mt2', organizations: ['Example Org'], organizationIds: [ORG] }
   await clock.advance(2 * 60_000)
   // The turn ran check_in and advance_cursor itself.
   state.answer = { pending: false, marker: null }
@@ -95,7 +96,7 @@ test('a mention the running turn handled itself wakes nothing after it', async (
 test('a subagent turn does not hold the wake-up', async ($, on) => {
   const { clock, state, prompts } = await live($, on)
   await $.turn.start({ text: 'sub', turnId: 'sub-1', agentId: 'agent-1' })
-  state.answer = { pending: true, marker: 'sa1', organizations: ['Example Org'] }
+  state.answer = { pending: true, marker: 'sa1', organizations: ['Example Org'], organizationIds: [ORG] }
   await clock.advance(50_000)
   expect(prompts).toEqual([WAKE])
 })
@@ -103,7 +104,7 @@ test('a subagent turn does not hold the wake-up', async ($, on) => {
 test('a turn that never reports its end holds the wake-up at most STUCK_TURN_MS', async ($, on) => {
   const { clock, state, prompts } = await live($, on)
   await $.turn.start({ text: 'stuck', turnId: 'stuck-1' })
-  state.answer = { pending: true, marker: 'st1', organizations: ['Example Org'] }
+  state.answer = { pending: true, marker: 'st1', organizations: ['Example Org'], organizationIds: [ORG] }
   await clock.advance(STUCK_TURN_MS - 60_000)
   expect(prompts).toHaveLength(0)
   await clock.advance(2 * 60_000)
@@ -113,13 +114,13 @@ test('a turn that never reports its end holds the wake-up at most STUCK_TURN_MS'
 test('a burst of 10 items over 2 minutes plus a mention still wakes within 60 s', async ($, on) => {
   const { clock, state, prompts } = await live($, on)
   // An earlier wake-up, just handled.
-  state.answer = { pending: true, marker: 'e0', organizations: ['Example Org'] }
+  state.answer = { pending: true, marker: 'e0', organizations: ['Example Org'], organizationIds: [ORG] }
   await clock.advance(40_000)
   expect(prompts).toHaveLength(1)
   // Ten more items, 12 s apart, the mention among the first: each check
   // sees a new marker, and the debounce never restarts.
   for (let i = 1; i <= 10; i++) {
-    state.answer = { pending: true, marker: `b${i}`, organizations: ['Example Org'] }
+    state.answer = { pending: true, marker: `b${i}`, organizations: ['Example Org'], organizationIds: [ORG] }
     await clock.advance(12_000)
     if (i === 5) {
       // 60 s after the first of them.

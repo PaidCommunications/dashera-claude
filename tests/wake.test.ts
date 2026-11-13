@@ -38,7 +38,7 @@ test('wakes once per new marker, never closer than MIN_GAP_MS', async ($, on) =>
   answer = { pending: true, marker: 'a1' }
   await clock.advance(45_000)
   expect(prompts).toHaveLength(1)
-  expect(prompts[0]).toBe('New activity in Dashera')
+  expect(prompts[0]).toBe(wakePrompt())
 
   // The same marker never wakes it again.
   await clock.advance(5 * 30_000)
@@ -257,12 +257,21 @@ test("doesn't ask for a rule when the connector itself refuses", async ($, on) =
   expect(prompts).toHaveLength(0)
 })
 
-test('the wake-up prompt is exactly "New activity in Dashera: <org>" (0.3.2)', () => {
-  expect(wakePrompt(['Example Org'])).toBe('New activity in Dashera: Example Org')
-  expect(wakePrompt(['Example Org', 'Other Org'])).toBe('New activity in Dashera: Example Org, Other Org')
-  // An older Dashera that doesn't say where.
-  expect(wakePrompt()).toBe('New activity in Dashera')
-  expect(wakePrompt([])).toBe('New activity in Dashera')
+test('the wake-up prompt is a fixed template with organization ids only (0.3.4)', () => {
+  const a = '0b6f4a1e-6d2c-4c1b-9f43-2a7d8e5b1c01'
+  const b = '7C9E2D44-1A3B-4E5F-8A6B-9C0D1E2F3A4B'
+  expect(wakePrompt([a])).toBe(
+    `New activity in Dashera (organization id ${a}). Run check_in with brief: true, passing that id as organization.`,
+  )
+  expect(wakePrompt([a, b, a])).toBe(
+    `New activity in Dashera (organization ids ${a}, ${b.toLowerCase()}). Run check_in with brief: true in each, passing its id as organization.`,
+  )
+  // An older Dashera that doesn't say where, or says it by name.
+  const plain = 'New activity in Dashera. Run check_in with brief: true in each organization you work in.'
+  expect(wakePrompt()).toBe(plain)
+  expect(wakePrompt([])).toBe(plain)
+  expect(wakePrompt(['Example Org'])).toBe(plain)
+  expect(wakePrompt('not a list')).toBe(plain)
 })
 
 test('stands by, and says so, while a newer session of the agent is live', async ($, on) => {

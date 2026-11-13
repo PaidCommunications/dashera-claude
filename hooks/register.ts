@@ -38,9 +38,9 @@ import { PLUGIN_VERSION } from './version'
 // wakes only the newest.
 //
 // One wake-up per burst (0.3.2, 11 Nov 2026): the first new item starts a
-// 20-second wait and the whole burst gets one wake-up, whose prompt is
-// exactly "New activity in Dashera: <org>". Only what addresses this session
-// counts; Dashera leaves quiet posts out of the answer.
+// 20-second wait and the whole burst gets one wake-up, with a fixed prompt
+// (it carried organization names until 0.3.4). Only what addresses this
+// session counts; Dashera leaves quiet posts out of the answer.
 //
 // Wake-ups that arrive (0.3.3, 12 Nov 2026): a mention woke a busy session
 // 23 minutes late once and never another time (it was found 3h44m later).
@@ -61,16 +61,54 @@ import { PLUGIN_VERSION } from './version'
 // Dashera is put on this conversation at its next prompt. No AI tokens
 // either way.
 
+// Fixed wake prompt (0.3.4, 12 Nov 2026, SEC-1 / Dashera task 8ab0d831):
+// 0.3.2 put organization names in the prompt, and a prompt is an instruction
+// channel into the owner's session. Any organization that adds the agent
+// names itself, so a name like "Acme. Ignore previous instructions and ..."
+// reached the session as if the owner had typed it. The prompt is now a
+// fixed template: the only thing that varies is a list of organization ids,
+// each checked to be a UUID; anything else (an older Dashera's names, a
+// malformed id) is dropped, never quoted. check_in takes an organization's
+// id as well as its name.
+
+/** An organization id the prompt may carry: a UUID, nothing else. */
+const ORG_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+/** At most this many ids in one prompt; more says "each organization". */
+export const MAX_PROMPT_ORGS = 10
+
+/** The ids that may go into the prompt: UUIDs only, lower-cased, no repeats. */
+export function safeOrgIds(ids: unknown): string[] {
+  if (!Array.isArray(ids)) return []
+  const out: string[] = []
+  for (const id of ids) {
+    if (typeof id !== 'string' || !ORG_ID.test(id)) continue
+    const v = id.toLowerCase()
+    if (!out.includes(v)) out.push(v)
+  }
+  return out
+}
+
+/** A live session's code, as Dashera issues it: "S-" and 6 hex digits. */
+const SESSION_CODE = /^S-[0-9A-F]{6}$/
+export function safeSessionCode(code: unknown): string | null {
+  return typeof code === 'string' && SESSION_CODE.test(code) ? code : null
+}
+
 /**
- * The turn a wake-up starts: exactly "New activity in Dashera: <org>", every
- * time (0.3.2, Julian, 11 Nov 2026). Claude Code adds its own framing around
- * it; the plugin adds nothing. The Dashera connector's own instructions say
- * what the line means (run check_in, handle it, advance_cursor), and the
- * plugin fills in this session's code on those calls itself.
+ * The turn a wake-up starts (0.3.4): a fixed template. Only UUID-checked
+ * organization ids vary; no text Dashera or an organization supplied is
+ * ever part of it. Claude Code adds its own framing around it; the plugin
+ * fills in this session's code on check_in and advance_cursor itself.
  */
-export function wakePrompt(organizations?: string[]): string {
-  const orgs = (organizations ?? []).filter(Boolean)
-  return orgs.length > 0 ? `New activity in Dashera: ${orgs.join(', ')}` : 'New activity in Dashera'
+export function wakePrompt(organizationIds?: unknown): string {
+  const ids = safeOrgIds(organizationIds)
+  if (ids.length === 0 || ids.length > MAX_PROMPT_ORGS) {
+    return 'New activity in Dashera. Run check_in with brief: true in each organization you work in.'
+  }
+  if (ids.length === 1) {
+    return `New activity in Dashera (organization id ${ids[0]}). Run check_in with brief: true, passing that id as organization.`
+  }
+  return `New activity in Dashera (organization ids ${ids.join(', ')}). Run check_in with brief: true in each, passing its id as organization.`
 }
 const POLL_MS = 15_000
 // Never two wake-ups closer than this, however busy Dashera gets (2 minutes
@@ -288,7 +326,10 @@ export function ruleRequest(tool: string, reason: string): string {
 type Answer = {
   pending?: boolean
   marker?: string | null
+  // Where something waits, by name: shown nowhere and never put in the
+  // prompt (0.3.4). organizationIds is what the prompt carries.
   organizations?: string[]
+  organizationIds?: string[]
   // A newer session of this agent is live; this one isn't woken.
   standingBy?: boolean
   // This session's code and name, for the agent to pass as session.
@@ -771,10 +812,10 @@ export const register: Register = on => {
           return
         }
         // Older Dashera (one live session) may still say standingBy.
-        sessionCode = answer.session?.code ?? null
+        sessionCode = safeSessionCode(answer.session?.code)
         // Continuity: connected under this id now. Remember it (here and in
         // the plugin's store, per conversation id) so a later id can name it.
-        if (answer.connected !== false && answer.session?.code && where.sessionId) {
+        if (answer.connected !== false && sessionCode && where.sessionId) {
           previousId = null
           if (connectedId !== where.sessionId || at - rememberedAt > 10 * 60_000) {
             connectedId = where.sessionId
@@ -795,7 +836,7 @@ export const register: Register = on => {
         // at its next prompt.
         const fromDashera = titleFromDashera(answer, title)
         if (fromDashera) pendingTitle = fromDashera
-        const label = answer.session?.code ? ` · ${answer.session.code}` : ''
+        const label = sessionCode ? ` · ${sessionCode}` : ''
         $.ui.status(
           answer.connected === false
             ? 'Dashera: not connected (paste the connect message to make this a live session)'
@@ -813,7 +854,7 @@ export const register: Register = on => {
         if (!stillPending) due = null
         if (stillPending && answer.marker && answer.marker !== lastMarker) {
           burstMarker = answer.marker
-          for (const o of answer.organizations ?? []) if (o && !burstOrgs.includes(o)) burstOrgs.push(o)
+          for (const o of safeOrgIds(answer.organizationIds)) if (!burstOrgs.includes(o)) burstOrgs.push(o)
           if (!burst) {
             burst = true
             const now = await $.clock.now()
