@@ -78,6 +78,16 @@ import { PLUGIN_VERSION } from './version'
 // prompt entered sends its marker as deliveredMarker, once. Both go only to a
 // Dashera whose wake_status takes them (its tool list says so), and a copy
 // that stands down sends neither.
+//
+// Activity (0.3.7, Julian, 13 Nov 2026): Dashera's "Thinking…" bubble shows
+// what the agent is doing, privacy first. While a main-loop turn runs, the
+// plugin keeps the KIND of the latest tool call as one fixed label
+// (ACTIVITY_LABELS: "Reading files", "Editing code", ...) and the time of
+// that call. The same checks carry it as `activity` and `activityAt`, beside
+// turnStartedAt, never a request of their own. Only the label is kept and
+// sent: never the tool's name, inputs, file names, commands, URLs or
+// content. It clears when the turn ends, goes only to a Dashera whose
+// wake_status takes it, and a copy that stands down sends none.
 
 // Rename sync (0.2.14, Julian, 7 Nov 2026): the check also carries this
 // conversation's title when it changed, read from the tail of the
@@ -321,6 +331,52 @@ export function turnStartedAtToSend(
   return lastSent !== null && lastSent !== 'none' ? 'none' : null
 }
 
+/** Whether this Dashera takes the activity label (0.3.7; its tool list says so). */
+export const takesActivity = (t: { description: string }) => /activityAt/.test(t.description)
+
+/**
+ * The only labels the activity report (0.3.7) ever sends. Dashera accepts
+ * exactly these and ignores anything else.
+ */
+export const ACTIVITY_LABELS = [
+  'Reading files',
+  'Editing code',
+  'Running a command',
+  'Searching the web',
+  'Using Dashera',
+  'Using a browser',
+  'Working with a sub-agent',
+  'Working',
+] as const
+export type ActivityLabel = (typeof ACTIVITY_LABELS)[number]
+
+const READ_TOOLS = new Set(['Read', 'Grep', 'Glob', 'LS'])
+const EDIT_TOOLS = new Set(['Edit', 'MultiEdit', 'Write', 'NotebookEdit'])
+const COMMAND_TOOLS = new Set(['Bash', 'BashOutput', 'KillShell'])
+const WEB_TOOLS = new Set(['WebSearch', 'WebFetch'])
+const AGENT_TOOLS = new Set(['Agent', 'Task'])
+
+/**
+ * The label for a tool call (0.3.7): its kind, from the tool's name alone,
+ * as one of ACTIVITY_LABELS. `dasheraPrefixes` are the `mcp__<server>__`
+ * prefixes of this conversation's Dashera connectors (a claude.ai connector
+ * is named by an id, not "dashera"). Never looks at the call's arguments.
+ */
+export function activityLabel(tool: string, dasheraPrefixes: Iterable<string> = []): ActivityLabel {
+  if (READ_TOOLS.has(tool)) return 'Reading files'
+  if (EDIT_TOOLS.has(tool)) return 'Editing code'
+  if (COMMAND_TOOLS.has(tool)) return 'Running a command'
+  if (WEB_TOOLS.has(tool)) return 'Searching the web'
+  if (AGENT_TOOLS.has(tool)) return 'Working with a sub-agent'
+  if (/^mcp__dashera__/.test(tool)) return 'Using Dashera'
+  for (const p of dasheraPrefixes) if (p && tool.startsWith(p)) return 'Using Dashera'
+  if (/^mcp__.*(chrome|browser|playwright|puppeteer)/i.test(tool)) return 'Using a browser'
+  return 'Working'
+}
+
+/** The `mcp__<server>__` prefix of a wake tool's name, or null. */
+export const mcpPrefix = (name: string) => /^(mcp__.+__)wake_status$/.exec(name)?.[1] ?? null
+
 /** Whether this Dashera takes previousSessionId (its tool list says so). */
 export const takesPrevious = (t: { description: string }) => /previousSessionId/.test(t.description)
 
@@ -503,6 +559,11 @@ export const register: Register = on => {
   let turnSent: string | null = null
   let deliveredPending: string | null = null
   let queuedMarker: string | null = null
+  // Activity (0.3.7): the label of the main loop's latest tool call in the
+  // running turn and when it was made (never anything else of the call), and
+  // the prefixes of the Dashera connectors this copy checks through.
+  let activity: { label: ActivityLabel; at: number } | null = null
+  const dasheraPrefixes = new Set<string>()
 
   // The owner renamed the session in Dashera: the conversation takes that
   // name at the next prompt Claude Code allows a title on (a wake-up's
@@ -527,6 +588,7 @@ export const register: Register = on => {
     if (e.agentId === undefined) {
       if (running.size === 0) {
         runningSince = await $.clock.now()
+        activity = null
         // A wake-up that waited in the engine's queue enters with this turn.
         if (queuedMarker) {
           deliveredPending = queuedMarker
@@ -539,6 +601,8 @@ export const register: Register = on => {
   }).catch(($, e, next) => next(e))
   on('turn.complete', async ($, e, next) => {
     if (e.agentId === undefined && running.delete(e.turnId) && running.size === 0) {
+      // The turn ended: its activity goes with it (0.3.7).
+      activity = null
       // Idle again: check now rather than at the next tick.
       checkSoon?.()
     }
@@ -587,6 +651,15 @@ export const register: Register = on => {
     // plugin's own checks.
     const origin = (next as unknown as { origin?: { plugin?: string } }).origin
     if (isConnectTool(e.tool) && selfCalls === 0 && origin?.plugin !== $.plugin.name) engaged = true
+    // Activity (0.3.7): the kind of the main loop's latest call in a running
+    // turn, as a fixed label; the call's arguments are never read here.
+    if (e.agentId === undefined && running.size > 0 && origin?.plugin !== $.plugin.name) {
+      try {
+        activity = { label: activityLabel(e.tool, dasheraPrefixes), at: await $.clock.now() }
+      } catch {
+        // No label this time; the call goes on as usual.
+      }
+    }
     if (!sessionCode || !takesSession(e.tool) || typeof args.session === 'string') return next(e)
     try {
       const r = await next({ ...e, session: sessionCode } as typeof e)
@@ -821,6 +894,11 @@ export const register: Register = on => {
         }
         const tools = await $.tool.list()
         const found = wakeTools(tools, lastGood)
+        // The Dashera connectors' prefixes, so their calls read "Using Dashera".
+        for (const t of found) {
+          const p = /dashera/i.test(t.description + t.name) ? mcpPrefix(t.name) : null
+          if (p) dasheraPrefixes.add(p)
+        }
         if (found.length === 0) {
           // Connected to a Dashera that predates it, or not at all.
           $.ui.status(
@@ -877,6 +955,9 @@ export const register: Register = on => {
           ? null
           : turnStartedAtToSend(running.size > 0, runningSince, at, turnSent)
         const deliveredValue = standingDown ? null : deliveredPending
+        // Activity (0.3.7): only beside a running turn's start, never "none".
+        const activityValue =
+          turnValue && turnValue !== 'none' && activity && activity.at >= runningSince ? activity : null
         let reported: { turn: string | null; delivered: string | null } | null = null
         for (const t of found) {
           // Continuity: only to a Dashera whose tool takes it (an older tool
@@ -886,9 +967,11 @@ export const register: Register = on => {
           const withInstance = sendWhere && takesInstance(t) ? { ...extra, instance } : extra
           const turn = sendWhere && turnValue && takesTurnStarted(t) ? turnValue : null
           const delivered = sendWhere && deliveredValue && takesDelivered(t) ? deliveredValue : null
+          const act = turn && activityValue && takesActivity(t) ? activityValue : null
           const base: Record<string, string> = {
             ...withInstance,
             ...(turn ? { turnStartedAt: turn } : {}),
+            ...(act ? { activity: act.label, activityAt: new Date(act.at).toISOString() } : {}),
             ...(delivered ? { deliveredMarker: delivered } : {}),
           }
           let reply = await askWithin(t.name, prev ? { ...base, previousSessionId: prev } : base)
@@ -958,6 +1041,7 @@ export const register: Register = on => {
           turnSent = null
           deliveredPending = null
           queuedMarker = null
+          activity = null
           probeAt = at + STAND_DOWN_RECHECK_MS
           stillPending = false
           due = null
