@@ -54,6 +54,20 @@ import { PLUGIN_VERSION } from './version'
 // its first new item, however much keeps arriving (the 2-minute gap is now
 // 30 seconds).
 //
+// Stand-down and the not-connected note (0.3.5, HG task 17215051, 12 Nov
+// 2026). Two copies of the plugin in one conversation (the installed plugin
+// and a session mod of it, or an old copy for a while after an update) both
+// checked for it. Dashera wakes only one of them (the keeper) and now tells
+// the other `standDown: true`: that copy stops its checks, says so once on
+// the status line, and asks once every STAND_DOWN_RECHECK_MS in case the
+// keeper went away (alone again, it goes back to checking as usual). And a
+// conversation the plugin checks from that isn't connected only said so on
+// the status line, which the agent never sees: once the agent has called a
+// connect tool here itself (wake_status, name_my_session, live_session), a
+// still-unconnected answer is put to it once per conversation as a short
+// descriptive note with the plugin's own session code. Conversations nobody
+// tries to connect never get a turn from it.
+
 // Rename sync (0.2.14, Julian, 7 Nov 2026): the check also carries this
 // conversation's title when it changed, read from the tail of the
 // conversation's transcript (never its content), so the session's name in
@@ -318,6 +332,32 @@ export function wakeTools<T extends { name: string; description: string }>(
   return tools.filter(t => isWakeTool(t.name)).sort((a, b) => rank(a) - rank(b))
 }
 
+/** A stood-down copy asks this often in case the keeper went away (0.3.5). */
+export const STAND_DOWN_RECHECK_MS = 10 * 60_000
+/** The one line a copy that stands down shows (0.3.5). */
+export const STAND_DOWN_STATUS =
+  'Live on Dashera: standing down (another copy of the plugin checks for this conversation)'
+/** The model's own calls that mean it is connecting this conversation (0.3.5). */
+export const isConnectTool = (name: string) =>
+  /^mcp__.+__(wake_status|name_my_session|live_session)$/.test(name)
+/** A not-connected note that the app turned away is offered at most this often. */
+export const NOT_CONNECTED_TRIES = 3
+
+/**
+ * The note an unconnected conversation's agent gets once (0.3.5): a fixed
+ * template; only a code in Dashera's form (S- and 6 hex digits) varies.
+ * `full`: Dashera left the session out because its owner's live sessions
+ * are all in use.
+ */
+export function notConnectedNote(code: unknown, full = false): string | null {
+  const c = safeSessionCode(code)
+  if (!c) return null
+  if (full) {
+    return `Live on Dashera note: the Dashera plugin checks for wake-ups in this conversation as session ${c}. Dashera left that session unconnected because its owner's live sessions are all in use, so nothing in Dashera wakes this conversation; it connects by itself once one of them ends (End live session on the agent's card in Dashera).`
+  }
+  return `Live on Dashera note: the Dashera plugin checks for wake-ups in this conversation as session ${c}, and that session isn't connected, so nothing in Dashera wakes this conversation yet. name_my_session with session "${c}" and this conversation's title as name connects it; the plugin fills in that session code when session is left out.`
+}
+
 /** The one turn that asks the person for the rule; nothing changes without their yes. */
 export function ruleRequest(tool: string, reason: string): string {
   return `Live on Dashera can't check for new work in this conversation: ${reason}. Ask the person you work with, once and in plain words, whether to add "${tool}" to "permissions" > "allow" in ~/.claude/settings.json. It lets only that yes/no check through, nothing else. Change the file only after they say yes, keep it valid JSON, and tell them it takes effect within 30 seconds with no restart. If they say no, drop it; they can switch this conversation out of auto mode instead.`
@@ -344,6 +384,12 @@ type Answer = {
   // This conversation's live session was ended on purpose (0.2.15): stop
   // checking until the next prompt here.
   ended?: { at: string; by: 'session' | 'owner' } | null
+  // Left unconnected because the owner's live sessions are full (only read
+  // as present or not; its text never reaches a prompt).
+  refused?: string
+  // Another copy of the plugin checks for this conversation and is the one
+  // woken (0.3.5): this copy stops its checks.
+  standDown?: boolean
 }
 
 /** The status line for an ended session (0.2.15). */
@@ -404,6 +450,13 @@ export const register: Register = on => {
   let resumedTranscript: string | null = null
   // This copy of the plugin (0.3.1): Dashera wakes only the newest copy.
   const instance = newInstanceId()
+  // Not-connected note (0.3.5): the model called a connect tool itself since
+  // the last note; the conversations already told; tries per conversation;
+  // and whether this copy is calling wake_status itself right now.
+  let engaged = false
+  const notedFor = new Set<string>()
+  const noteTries = new Map<string, number>()
+  let selfCalls = 0
   // Delivery (0.3.3): the main loop's turns running now and since when; a
   // wake-up whose wait ended and that hasn't entered yet; when a dropped one
   // may be asked again; and the check to run when a turn ends.
@@ -486,6 +539,10 @@ export const register: Register = on => {
   // refuses the argument the call goes on as the agent wrote it.
   on('tool.call', async ($, e, next) => {
     const args = e as unknown as Record<string, unknown>
+    // The model connecting this conversation itself (0.3.5); never this
+    // plugin's own checks.
+    const origin = (next as unknown as { origin?: { plugin?: string } }).origin
+    if (isConnectTool(e.tool) && selfCalls === 0 && origin?.plugin !== $.plugin.name) engaged = true
     if (!sessionCode || !takesSession(e.tool) || typeof args.session === 'string') return next(e)
     try {
       const r = await next({ ...e, session: sessionCode } as typeof e)
@@ -646,6 +703,9 @@ export const register: Register = on => {
         delivering = false
       }
     }
+    // Stand-down (0.3.5): whether this copy stands down, and when it asks again.
+    let standingDown = false
+    let probeAt = Number.NEGATIVE_INFINITY
     let sendWhere = true
     let rememberedAt = Number.NEGATIVE_INFINITY
     let whereDroppedAt = 0
@@ -665,6 +725,9 @@ export const register: Register = on => {
       polling = true
       try {
         const at = await $.clock.now()
+        // Stood down (0.3.5): only the occasional check, in case the copy
+        // Dashera wakes went away.
+        if (standingDown && at < probeAt) return
         // Continuity: the id now (a resume or a /clear changes it, and no
         // session.start says so). A changed one names the id it continues.
         const idNow = await within($.session.id(), 2000)
@@ -732,6 +795,7 @@ export const register: Register = on => {
               .join('\n')
             return { text: text || JSON.stringify(r.structuredContent ?? null), failed: r.isError }
           } catch (err) {
+            selfCalls += 1
             try {
               const r = await $.tool.call({
                 tool: name as `mcp__${string}__${string}`,
@@ -741,6 +805,8 @@ export const register: Register = on => {
               return { text, failed: r.deny !== undefined || !!r.isError }
             } catch {
               return { text: String(err), failed: true }
+            } finally {
+              selfCalls -= 1
             }
           }
         }
@@ -811,6 +877,21 @@ export const register: Register = on => {
           $.ui.status(ENDED_STATUS)
           return
         }
+        // Another copy is the one Dashera wakes (0.3.5): stop checking, say
+        // so once, and ask again only every STAND_DOWN_RECHECK_MS. Nothing
+        // this copy held is delivered.
+        if (answer.standDown === true) {
+          if (!standingDown) {
+            standingDown = true
+            $.ui.status(STAND_DOWN_STATUS)
+          }
+          probeAt = at + STAND_DOWN_RECHECK_MS
+          stillPending = false
+          due = null
+          return
+        }
+        // Alone again: back to checking as usual.
+        standingDown = false
         // Older Dashera (one live session) may still say standingBy.
         sessionCode = safeSessionCode(answer.session?.code)
         // Continuity: connected under this id now. Remember it (here and in
@@ -870,6 +951,28 @@ export const register: Register = on => {
         }
         // A wake-up held by a turn, or dropped, goes now if it can.
         if (due) await deliver()
+        // Not connected, and the agent tried to connect it (0.3.5): the
+        // note, once per conversation, when the session is idle.
+        const conv = where.sessionId
+        if (answer.connected === false && engaged && conv && !notedFor.has(conv) && running.size === 0) {
+          const note = notConnectedNote(sessionCode, typeof answer.refused === 'string')
+          const tries = noteTries.get(conv) ?? 0
+          if (note && tries < NOT_CONNECTED_TRIES) {
+            noteTries.set(conv, tries + 1)
+            const sent = await within(
+              $.prompt.submit({ text: note }).then(
+                r => !('drop' in r && r.drop !== undefined),
+                () => false,
+              ),
+              SUBMIT_ANSWER_MS,
+            )
+            // No answer in time: it waits in the engine's queue.
+            if (sent !== false) {
+              notedFor.add(conv)
+              engaged = false
+            }
+          }
+        }
       } catch {
         // The connector may be reconnecting; the next tick tries again.
       } finally {
