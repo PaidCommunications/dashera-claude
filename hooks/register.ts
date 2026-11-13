@@ -67,6 +67,17 @@ import { PLUGIN_VERSION } from './version'
 // still-unconnected answer is put to it once per conversation as a short
 // descriptive note with the plugin's own session code. Conversations nobody
 // tries to connect never get a turn from it.
+//
+// Turn report (0.3.6, Who gets it receipts, 12 Nov 2026): Dashera shows
+// "Working…" on a session while it runs a turn and "Delivered" once a
+// wake-up's turn started, and it can only know either from here. The checks
+// already running carry it, never a request of their own: while a main-loop
+// turn runs (the person's or a wake-up's) each check sends turnStartedAt, the
+// turn's start (Dashera counts a turn over after 90 s without a report), and
+// the first check after it ends sends "none". The check after a wake-up's
+// prompt entered sends its marker as deliveredMarker, once. Both go only to a
+// Dashera whose wake_status takes them (its tool list says so), and a copy
+// that stands down sends neither.
 
 // Rename sync (0.2.14, Julian, 7 Nov 2026): the check also carries this
 // conversation's title when it changed, read from the tail of the
@@ -290,6 +301,26 @@ export function newInstanceId(): string {
 /** Whether this Dashera tells plugin copies apart (its tool list says so). */
 export const takesInstance = (t: { description: string }) => /\binstance\b/.test(t.description)
 
+/** Whether this Dashera takes the turn report (0.3.6; its tool list says so). */
+export const takesTurnStarted = (t: { description: string }) => /turnStartedAt/.test(t.description)
+export const takesDelivered = (t: { description: string }) => /deliveredMarker/.test(t.description)
+
+/**
+ * The turnStartedAt this check sends (0.3.6), or null for none: the running
+ * turn's start on every check (a turn Dashera hears nothing of for 90 s
+ * counts as over), and "none" once after it ends. A turn that never
+ * reported its end counts as over after STUCK_TURN_MS.
+ */
+export function turnStartedAtToSend(
+  busy: boolean,
+  since: number,
+  now: number,
+  lastSent: string | null,
+): string | null {
+  if (busy && now - since < STUCK_TURN_MS) return new Date(since).toISOString()
+  return lastSent !== null && lastSent !== 'none' ? 'none' : null
+}
+
 /** Whether this Dashera takes previousSessionId (its tool list says so). */
 export const takesPrevious = (t: { description: string }) => /previousSessionId/.test(t.description)
 
@@ -466,6 +497,12 @@ export const register: Register = on => {
   let delivering = false
   let retryAt = Number.NEGATIVE_INFINITY
   let checkSoon: (() => void) | null = null
+  // Turn report (0.3.6): the turnStartedAt Dashera last got; the marker of a
+  // wake-up whose prompt entered, until a check carries it; and one whose
+  // submit didn't answer in time, which enters with the next turn.
+  let turnSent: string | null = null
+  let deliveredPending: string | null = null
+  let queuedMarker: string | null = null
 
   // The owner renamed the session in Dashera: the conversation takes that
   // name at the next prompt Claude Code allows a title on (a wake-up's
@@ -488,7 +525,14 @@ export const register: Register = on => {
   // idle. A subagent's run is part of a turn the main loop already holds.
   on('turn.start', async ($, e, next) => {
     if (e.agentId === undefined) {
-      if (running.size === 0) runningSince = await $.clock.now()
+      if (running.size === 0) {
+        runningSince = await $.clock.now()
+        // A wake-up that waited in the engine's queue enters with this turn.
+        if (queuedMarker) {
+          deliveredPending = queuedMarker
+          queuedMarker = null
+        }
+      }
       running.add(e.turnId)
     }
     return next(e)
@@ -696,6 +740,11 @@ export const register: Register = on => {
           retryAt = (await $.clock.now()) + RETRY_DROPPED_MS
           return
         }
+        // Entered: the next check tells Dashera (0.3.6). Queued: it enters
+        // with the next turn, and is told then (a turn that started while
+        // the submit was answering is that turn).
+        if (answer === 'entered' || (running.size > 0 && runningSince >= now)) deliveredPending = d.marker
+        else queuedMarker = d.marker
         lastMarker = d.marker
         lastWakeAt = now
         if (due === d) due = null
@@ -822,12 +871,26 @@ export const register: Register = on => {
         // The conversation's title goes with the details, when it changed.
         const sending = titleToSend(title, lastSentTitle)
         const extra = sendWhere ? { ...where, ...(sending ? { title: sending } : {}) } : {}
+        // The turn report (0.3.6) rides on this same check; never from a
+        // copy that stands down.
+        const turnValue = standingDown
+          ? null
+          : turnStartedAtToSend(running.size > 0, runningSince, at, turnSent)
+        const deliveredValue = standingDown ? null : deliveredPending
+        let reported: { turn: string | null; delivered: string | null } | null = null
         for (const t of found) {
           // Continuity: only to a Dashera whose tool takes it (an older tool
           // list refuses an unknown field), and never instead of the rest.
           const prev = sendWhere && previousId && takesPrevious(t) ? previousId : null
           // Which copy asks, only to a Dashera that takes it (0.3.1).
-          const base = sendWhere && takesInstance(t) ? { ...extra, instance } : extra
+          const withInstance = sendWhere && takesInstance(t) ? { ...extra, instance } : extra
+          const turn = sendWhere && turnValue && takesTurnStarted(t) ? turnValue : null
+          const delivered = sendWhere && deliveredValue && takesDelivered(t) ? deliveredValue : null
+          const base: Record<string, string> = {
+            ...withInstance,
+            ...(turn ? { turnStartedAt: turn } : {}),
+            ...(delivered ? { deliveredMarker: delivered } : {}),
+          }
           let reply = await askWithin(t.name, prev ? { ...base, previousSessionId: prev } : base)
           if (reply === TIMED_OUT) return
           if (prev && (reply.failed || !parse(reply.text))) {
@@ -851,9 +914,15 @@ export const register: Register = on => {
           if (answer) {
             lastGood = t.name
             if (withDetails && sending) lastSentTitle = sending
+            if (withDetails) reported = { turn, delivered }
             break
           }
           refused ??= reply
+        }
+        // Dashera got the turn report: the same is not sent again.
+        if (answer && reported) {
+          if (reported.turn) turnSent = reported.turn
+          if (reported.delivered && deliveredPending === reported.delivered) deliveredPending = null
         }
         if (!answer) {
           // Say why, and what to allow, instead of going quiet.
@@ -885,6 +954,10 @@ export const register: Register = on => {
             standingDown = true
             $.ui.status(STAND_DOWN_STATUS)
           }
+          // The copy Dashera wakes reports this conversation's turns now.
+          turnSent = null
+          deliveredPending = null
+          queuedMarker = null
           probeAt = at + STAND_DOWN_RECHECK_MS
           stillPending = false
           due = null
