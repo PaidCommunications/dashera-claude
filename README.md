@@ -8,7 +8,7 @@ Every 15 seconds, between turns, the plugin asks your Dashera connector's `wake_
 
 ## What the plugin sends
 
-Every 15 seconds while a conversation is open, the plugin calls your Dashera connection's `wake_status` tool with: the conversation's id, the computer's name, the app (Claude app or terminal), the folder name, the plugin's version, the conversation's title when it changes, a random id for this copy of the plugin (`instance`, new each time it loads), and, when the conversation goes on under a new id, the id it last checked in under (`previousSessionId`). While a turn runs it also sends the turn's start time and, from 0.3.7, one fixed label for the kind of the latest tool call (such as "Reading files") with that call's time; never the call's inputs, file names, commands, URLs or content. It never reads or sends what you write in the conversation. A conversation gets wake-ups only after it is connected and named, and End live session on the agent's card disconnects it. The answer is yes or no.
+Every 15 seconds while a conversation is open, the plugin calls your Dashera connection's `wake_status` tool with: the conversation's id, the computer's name, the app (Claude app or terminal), the folder name, the plugin's version, the conversation's title when it changes, a random id for this copy of the plugin (`instance`, new each time it loads), and, when the conversation goes on under a new id, the id it last checked in under (`previousSessionId`). While a turn runs it also sends the turn's start time and, from 0.3.7, one fixed label for the kind of the latest tool call (such as "Reading files") with that call's time; never the call's inputs, file names, commands, URLs or content. From 0.3.8 the check after a wake-up also says what became of its prompt (`submit`: entered, dropped or queued), once. It never reads or sends what you write in the conversation. A conversation gets wake-ups only after it is connected and named, and End live session on the agent's card disconnects it. The answer is yes or no.
 
 ## Before you install
 
@@ -56,9 +56,37 @@ Rename this conversation in Claude Code or the Claude app and the session's name
 
 The other way too: **Rename** the session on its card in Dashera and this conversation takes that name at its next prompt (a wake-up counts), through Claude Code's `sessionTitle` hook output. A name given in Dashera stays until the conversation is renamed again. Two sessions of one agent may share a name; their codes tell them apart, and Dashera's pickers show the code beside a shared name.
 
+## Two copies in one conversation
+
+**What happened (12 to 16 Nov 2026).** One conversation on the Mac Studio got no wake-up from 12 Nov on. Dashera saw two copies of the plugin checking in for it from one Claude process, with the same version and folder, told one to stand down, and woke the other, which never started a turn.
+
+**What the code did.** Up to 0.3.7 each copy started a 15-second interval at `session.start` and never cancelled it. Nothing stopped a copy: there was no claim on the conversation and no registry of copies, and a second `session.start` in the same registration started a second interval beside the first. Two copies run when the plugin is installed and a one-conversation copy of it sits in the session's mods folder, or when the engine runs a second `session.start` for a copy (an enable, a worker respawn). The engine's documentation says a reload loads the module in a fresh environment and cancels the old one's timers, so a reload alone should not leave a copy behind. Which of these made the doubled copy on that Mac is not confirmed; the commands below tell them apart. The folder Dashera shows is the conversation's working folder, so it is the same for every copy.
+
+**What 0.3.8 does.** Every copy claims the conversation before its first check, and the newest copy wins: it is the one loaded last (after an update, a reload or an enable), so it holds the live prompt hook. The claim lives in the plugin's own store and in a registry the copies of one environment share. An older copy that finds a newer copy's claim cancels all its timers, never calls `wake_status` again and leaves the status line alone. Its only timer reads the claim every 10 minutes and starts checking again only if the copy that took over stopped renewing its claim (5 minutes without renewing means it went away). A second `session.start` in one registration ends the first one's timers. Dashera's stand-down (0.3.5) still covers copies that share no store.
+
+The status line also shows each wake-up's result for 60 seconds (`Live on Dashera · S-XXXXXX · wake-up entered`, `dropped` or `queued`), so a copy whose prompts go nowhere is visible.
+
+**Confirm on the affected Mac** (read only; replace `<session-id>` with the conversation's id and `<project-folder>` with its folder under `~/.claude/projects`):
+
+```
+ls -la ~/.claude/dev-mods/
+ls -la ~/.claude/dev-mods/<session-id>/
+cat ~/.claude/dev-mods/<session-id>/dashera/hooks/version.ts
+git -C ~/.claude/dev-mods/<session-id>/dashera log -1 --oneline
+claude plugin list
+ps -axo pid,ppid,lstart,command | grep -i '[c]laude'
+ls -t ~/.claude/projects/<project-folder>/ | head
+grep -c 'New activity in Dashera' ~/.claude/projects/<project-folder>/<session-id>.jsonl
+grep 'New activity in Dashera' ~/.claude/projects/<project-folder>/<session-id>.jsonl | tail -3 | cut -c1-300
+grep -o '"dashera[^"]*hook[^"]*"' ~/.claude/projects/<project-folder>/<session-id>.jsonl | sort | uniq -c
+```
+
+A `dashera` folder under the session's mods folder and `dashera` in `claude plugin list` means two copies load in that conversation. One Claude process for the conversation (in `ps`) rules out two processes. The last `New activity in Dashera` line shows when a wake-up last entered. After updating, the agent's card shows 0.3.8 and one copy per conversation.
+
 ## What's new
 
 - **Updates need no restart** (tested 12 Nov 2026 on two Macs): an installed or updated plugin loads in an open conversation when its current turn ends, and the agent's card in Dashera shows the version the running session reports. See Update.
+- **0.3.8:** one live copy per conversation. Two copies of the plugin in one conversation no longer both check: the newest copy claims the conversation before its first check, and an older copy stops all its timers and never checks again (see Two copies in one conversation). Each wake-up's result (entered, dropped or queued) shows on the status line for 60 seconds and goes once with the next check as `submit`, only to a Dashera whose `wake_status` takes it.
 - **0.3.7:** the "Thinking…" bubble in Dashera shows what the agent is doing, privacy first. While a turn runs, the checks the plugin already makes also carry the kind of its latest tool call as one fixed label (`activity`: Reading files, Editing code, Running a command, Searching the web, Using Dashera, Using a browser, Working with a sub-agent, or Working) and when that call was made (`activityAt`). Never the tool's inputs, file names, commands, URLs or content, and not even the tool's name. It clears when the turn ends. No extra requests, only to a Dashera that takes it, and a copy that stands down sends none.
 - **0.3.6:** Dashera's receipts get real data. While this conversation runs a turn (yours or a wake-up's), the checks the plugin already makes also say when that turn started (`turnStartedAt`), so Dashera shows "Working…" on the session, and the first check after it ends says `"none"`. The check after a wake-up's prompt entered names that wake-up once (`deliveredMarker`), so the items it was for show "Delivered". No extra requests: it rides on the regular check, only to a Dashera that takes it, and a copy that stands down sends neither. The report is a time and a marker, never content.
 - **0.3.5:** two copies of the plugin in one conversation (the installed plugin and a one-conversation copy, or an old copy for a while after an update) no longer both keep checking: Dashera wakes one of them and tells the other to stand down. That copy stops its checks, says "standing down" on the status line, and checks once every 10 minutes in case the other copy went away (then it carries on as usual). And when the agent tries to connect a conversation that the plugin sees isn't connected, the agent gets one short note with the plugin's own session code, once per conversation; conversations nobody tries to connect get nothing.

@@ -1,4 +1,4 @@
-import type { Register } from 'claude-code'
+import type { Register, Timer } from 'claude-code'
 import { PLUGIN_VERSION } from './version'
 
 // Dashera wake-ups (1 Nov 2026). Every 15 seconds (30 until 5 Nov 2026), between turns, ask the
@@ -88,6 +88,25 @@ import { PLUGIN_VERSION } from './version'
 // sent: never the tool's name, inputs, file names, commands, URLs or
 // content. It clears when the turn ends, goes only to a Dashera whose
 // wake_status takes it, and a copy that stands down sends none.
+
+// One live copy per conversation (0.3.8, 16 Nov 2026): a conversation on
+// the Mac Studio got no wake-up from 12 Nov on. Dashera saw two copies
+// checking in for it (doubledSameConversation), one Claude process, and told
+// one to stand down; the copy it kept never started a turn. Nothing here
+// ever stopped a copy's timers: session.start started a 15-second interval
+// and never cancelled it, a second session.start in the same registration
+// started a second one beside it, and no copy knew of another. Now each copy
+// claims the conversation before its first check, and the newest copy wins:
+// it holds the live submit hook (a reload or an update loads after the old
+// one). The older copy cancels every timer and never sends wake_status
+// again. The claim lives in two places: a registry on globalThis (copies
+// that share an environment stop at once) and the plugin's store (copies in
+// separate environments, which is how the engine loads a reload, see the
+// next one at their next tick). A stopped copy reads the store every
+// STAND_DOWN_RECHECK_MS and comes back only if the owner stopped renewing
+// its claim (CLAIM_STALE_MS). Each wake-up's submit result (entered,
+// dropped, queued) shows on the status line for SUBMIT_SHOWN_MS and goes
+// once with the next check as `submit`, to a Dashera that takes it.
 
 // Rename sync (0.2.14, Julian, 7 Nov 2026): the check also carries this
 // conversation's title when it changed, read from the tail of the
@@ -424,6 +443,88 @@ export const STAND_DOWN_RECHECK_MS = 10 * 60_000
 /** The one line a copy that stands down shows (0.3.5). */
 export const STAND_DOWN_STATUS =
   'Live on Dashera: standing down (another copy of the plugin checks for this conversation)'
+// ---- One live copy per conversation (0.3.8) ----
+/** The store's key: which copy holds each conversation, and when it last said so. */
+export const LIVE_COPIES_KEY = 'liveCopies'
+/** The copy that holds a conversation renews its claim this often. */
+export const CLAIM_BEAT_MS = 60_000
+/** A claim not renewed for this long is the claim of a copy that went away. */
+export const CLAIM_STALE_MS = 5 * 60_000
+/** Claims older than this are dropped from the store. */
+const CLAIM_KEEP_MS = 24 * 3600_000
+/** How long a wake-up's submit result stays on the status line. */
+export const SUBMIT_SHOWN_MS = 60_000
+/** What became of a wake-up's prompt, as the engine answered its submit. */
+export type SubmitResult = 'entered' | 'dropped' | 'queued'
+/** Whether this Dashera takes the submit result (0.3.8; its tool list says so). */
+export const takesSubmit = (t: { description: string }) => /\bsubmit\b/.test(t.description)
+
+/** A copy of the plugin: its id, when it registered, and its order in this environment. */
+export type Copy = { instance: string; at: number; seq: number }
+/** A copy's claim on a conversation, renewed while it runs (seenAt). */
+export type Claim = Copy & { seenAt: number }
+
+/** Whether copy a registered after copy b (the newest copy wins). */
+export function newerCopy(a: Copy, b: Copy): boolean {
+  if (a.at !== b.at) return a.at > b.at
+  if (a.seq !== b.seq) return a.seq > b.seq
+  return a.instance > b.instance
+}
+
+/** The store's claims, cleaned: only well-formed entries. */
+export function claimsOf(raw: unknown): Record<string, Claim> {
+  const out: Record<string, Claim> = {}
+  if (!raw || typeof raw !== 'object') return out
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    const c = v as Partial<Claim> | null
+    if (
+      k && c && typeof c.instance === 'string' && typeof c.at === 'number' &&
+      typeof c.seq === 'number' && typeof c.seenAt === 'number'
+    ) {
+      out[k] = { instance: c.instance, at: c.at, seq: c.seq, seenAt: c.seenAt }
+    }
+  }
+  return out
+}
+
+/**
+ * What a copy does with a conversation's claim: it is the copy's own
+ * ("mine"), the copy takes it (none, an older copy's, or one its owner
+ * stopped renewing), or it yields to a newer copy that still renews it.
+ */
+export function claimStep(claim: Claim | undefined, me: Copy, now: number): 'mine' | 'take' | 'yield' {
+  if (!claim) return 'take'
+  if (claim.instance === me.instance) return 'mine'
+  if (newerCopy(claim, me) && now - claim.seenAt <= CLAIM_STALE_MS) return 'yield'
+  return 'take'
+}
+
+/** The claims with this one set and the long-gone ones dropped. */
+export function withClaim(claims: Record<string, Claim>, id: string, claim: Claim): Record<string, Claim> {
+  const next: Record<string, Claim> = {}
+  for (const [k, c] of Object.entries(claims)) if (claim.seenAt - c.seenAt <= CLAIM_KEEP_MS) next[k] = c
+  next[id] = claim
+  return next
+}
+
+// The copies in this environment, by conversation id. Copies the engine
+// loads into one environment see each other here at once; the store covers
+// the rest.
+type LiveCopy = Copy & { stop: () => void }
+const LIVE_COPIES = Symbol.for('dashera-claude.liveCopies')
+const LIVE_SEQ = Symbol.for('dashera-claude.liveSeq')
+function liveCopies(): Map<string, LiveCopy> {
+  const g = globalThis as unknown as Record<symbol, unknown>
+  if (!(g[LIVE_COPIES] instanceof Map)) g[LIVE_COPIES] = new Map<string, LiveCopy>()
+  return g[LIVE_COPIES] as Map<string, LiveCopy>
+}
+function nextSeq(): number {
+  const g = globalThis as unknown as Record<symbol, unknown>
+  const n = (typeof g[LIVE_SEQ] === 'number' ? (g[LIVE_SEQ] as number) : 0) + 1
+  g[LIVE_SEQ] = n
+  return n
+}
+
 /** The model's own calls that mean it is connecting this conversation (0.3.5). */
 export const isConnectTool = (name: string) =>
   /^mcp__.+__(wake_status|name_my_session|live_session)$/.test(name)
@@ -537,6 +638,24 @@ export const register: Register = on => {
   let resumedTranscript: string | null = null
   // This copy of the plugin (0.3.1): Dashera wakes only the newest copy.
   const instance = newInstanceId()
+  // One live copy per conversation (0.3.8): this copy, ordered by when it
+  // registered; whether a newer copy took over; and the hooks that end this
+  // copy's timers and start its slow look at the claim.
+  const me: Copy = { instance, at: Date.now(), seq: nextSeq() }
+  let stopped = false
+  let endStart: (() => void) | null = null
+  let onStop: (() => void) | null = null
+  const stopCopy = () => {
+    if (stopped) return
+    stopped = true
+    due = null
+    checkSoon = null
+    for (const [k, v] of liveCopies()) if (v.instance === instance) liveCopies().delete(k)
+    endStart?.()
+    onStop?.()
+  }
+  // Submit result (0.3.8): the latest wake-up's, until a check carries it.
+  let submitPending: SubmitResult | null = null
   // Not-connected note (0.3.5): the model called a connect tool itself since
   // the last note; the conversations already told; tries per conversation;
   // and whether this copy is calling wake_status itself right now.
@@ -672,6 +791,25 @@ export const register: Register = on => {
 
   on('session.start', async ($, e, next) => {
     const started = await next(e)
+    // A second start in this registration (0.3.8): the first one's timers
+    // end here, so one registration never runs two intervals.
+    endStart?.()
+    const timers = new Set<Timer>()
+    let probeTimer: Timer | null = null
+    const after = (ms: number, fn: () => void) => {
+      const t: Timer = $.clock.after(ms, () => {
+        timers.delete(t)
+        fn()
+      })
+      timers.add(t)
+      return t
+    }
+    endStart = () => {
+      for (const t of timers) t.cancel()
+      timers.clear()
+      probeTimer?.cancel()
+      probeTimer = null
+    }
     // A burst's timer from an earlier start may be gone: start clean (a
     // late one still wakes at most once per marker).
     burst = false
@@ -735,7 +873,7 @@ export const register: Register = on => {
       }
     }
     // On the plugin's own timer, after the start-up step has finished.
-    $.clock.after(1000, () => void gather())
+    after(1000, () => void gather())
     // Rename sync: the transcript file, found once (it appears with the
     // first message), and its tail read at most every TITLE_REFRESH_MS.
     let transcript: string | null = null
@@ -776,10 +914,35 @@ export const register: Register = on => {
       const found = lastCustomTitle(text)
       if (found) title = found
     }
+    // The status line (0.3.8: with the latest wake-up's submit result for
+    // SUBMIT_SHOWN_MS, so a copy whose prompts go nowhere shows it). A
+    // stopped copy says nothing: the copy that took over owns the line.
+    let shown: string | null = null
+    let submitNote: SubmitResult | null = null
+    let submitClear: Timer | null = null
+    const say = (text: string) => {
+      if (stopped) return
+      shown = text
+      void $.ui.status(submitNote ? `${text} · wake-up ${submitNote}` : text)
+    }
+    const showSubmit = (result: SubmitResult) => {
+      submitNote = result
+      say(shown ?? 'Live on Dashera')
+      if (submitClear) {
+        submitClear.cancel()
+        timers.delete(submitClear)
+      }
+      submitClear = after(SUBMIT_SHOWN_MS, () => {
+        submitNote = null
+        submitClear = null
+        if (shown) say(shown)
+      })
+    }
     // The burst's wait ended: one wake-up for all of it, unless the work was
     // handled meanwhile or the session ended.
     const wakeForBurst = async () => {
       burst = false
+      if (stopped) return
       const orgs = burstOrgs.splice(0)
       if (!stillPending || endedPause || !burstMarker || burstMarker === lastMarker) return
       // Due until its prompt enters (0.3.3); a newer burst takes its place
@@ -793,7 +956,7 @@ export const register: Register = on => {
     // of its own (then the first idle check sends it), or the engine dropped
     // it a moment ago. Delivered only when the prompt entered.
     const deliver = async () => {
-      if (!due || delivering || endedPause || !stillPending) return
+      if (!due || delivering || endedPause || !stillPending || stopped) return
       const now = await $.clock.now()
       if (running.size > 0 && now - runningSince < STUCK_TURN_MS) return
       if (now < retryAt) return
@@ -807,6 +970,10 @@ export const register: Register = on => {
           ),
           SUBMIT_ANSWER_MS,
         )
+        // What became of it, on the status line and to Dashera (0.3.8).
+        const result: SubmitResult = answer ?? 'queued'
+        submitPending = result
+        showSubmit(result)
         // No answer in time: it waits in the engine's queue, which runs it
         // once the session is idle.
         if (answer === 'dropped') {
@@ -832,8 +999,64 @@ export const register: Register = on => {
     let rememberedAt = Number.NEGATIVE_INFINITY
     let whereDroppedAt = 0
     let waitedForId = 0
+    // The claim (0.3.8): true when this copy holds the conversation (it
+    // takes it from an older copy, or one that went away); false when a
+    // newer copy holds it, and then this copy has stopped. Renewed every
+    // CLAIM_BEAT_MS. A store that can't be read leaves the registry alone
+    // to decide.
+    let beatAt = Number.NEGATIVE_INFINITY
+    // The store's claims, or null when the store can't be read.
+    const readClaims = async (): Promise<Record<string, Claim> | null> => {
+      const r = await within($.store.get(LIVE_COPIES_KEY).then(v => ({ v })), 2000)
+      return r ? claimsOf(r.v) : null
+    }
+    const holdClaim = async (id: string, now: number): Promise<boolean> => {
+      const live = liveCopies()
+      const other = live.get(id)
+      if (other && other.instance !== instance) {
+        if (newerCopy(other, me)) {
+          stopCopy()
+          return false
+        }
+        other.stop()
+      }
+      for (const [k, v] of live) if (v.instance === instance && k !== id) live.delete(k)
+      live.set(id, { ...me, stop: stopCopy })
+      const read = await readClaims()
+      if (stopped) return false
+      const claims = read ?? {}
+      const step = read ? claimStep(claims[id], me, Date.now()) : 'mine'
+      if (step === 'yield') {
+        stopCopy()
+        return false
+      }
+      if (read && (step === 'take' || now - beatAt >= CLAIM_BEAT_MS)) {
+        beatAt = now
+        await within($.store.set(LIVE_COPIES_KEY, withClaim(claims, id, { ...me, seenAt: Date.now() })), 2000)
+      }
+      return !stopped
+    }
+    // A stopped copy's only timer: a look at the claim every
+    // STAND_DOWN_RECHECK_MS. It never calls wake_status; it starts checking
+    // again only if the copy that took over stopped renewing its claim.
+    const probeOwner = async () => {
+      const id = where.sessionId
+      if (!stopped || !id) return
+      const other = liveCopies().get(id)
+      if (other && other.instance !== instance && newerCopy(other, me)) return
+      // A store that can't be read says nothing about the owner: stay stopped.
+      const claims = await readClaims()
+      if (!claims || claimStep(claims[id], me, Date.now()) === 'yield') return
+      stopped = false
+      probeTimer?.cancel()
+      probeTimer = null
+      begin()
+    }
+    onStop = () => {
+      probeTimer = $.clock.every(STAND_DOWN_RECHECK_MS, () => void probeOwner())
+    }
     const tick = async () => {
-      if (polling || endedPause) return
+      if (polling || stopped) return
       // Never check before this conversation's id is known (up to ~30 s):
       // a check without it can't be told apart from the agent's others.
       if (!where.sessionId && waitedForId < 6) {
@@ -847,6 +1070,10 @@ export const register: Register = on => {
       polling = true
       try {
         const at = await $.clock.now()
+        // One live copy (0.3.8): before any check, this copy holds the
+        // conversation or stops for good.
+        if (where.sessionId && !(await holdClaim(where.sessionId, at))) return
+        if (endedPause) return
         // Stood down (0.3.5): only the occasional check, in case the copy
         // Dashera wakes went away.
         if (standingDown && at < probeAt) return
@@ -901,7 +1128,7 @@ export const register: Register = on => {
         }
         if (found.length === 0) {
           // Connected to a Dashera that predates it, or not at all.
-          $.ui.status(
+          say(
             tools.some(t => /dashera/i.test(t.name + t.description) && /__whoami$/.test(t.name))
               ? 'Live on Dashera: waiting for Dashera to offer it'
               : 'Live on Dashera: add the Dashera connector to turn it on',
@@ -955,10 +1182,13 @@ export const register: Register = on => {
           ? null
           : turnStartedAtToSend(running.size > 0, runningSince, at, turnSent)
         const deliveredValue = standingDown ? null : deliveredPending
+        const submitValue = standingDown ? null : submitPending
         // Activity (0.3.7): only beside a running turn's start, never "none".
         const activityValue =
           turnValue && turnValue !== 'none' && activity && activity.at >= runningSince ? activity : null
-        let reported: { turn: string | null; delivered: string | null } | null = null
+        let reported: { turn: string | null; delivered: string | null; submit: SubmitResult | null } | null = null
+        // A newer copy took over while this tick ran: no check from here.
+        if (stopped) return
         for (const t of found) {
           // Continuity: only to a Dashera whose tool takes it (an older tool
           // list refuses an unknown field), and never instead of the rest.
@@ -968,11 +1198,13 @@ export const register: Register = on => {
           const turn = sendWhere && turnValue && takesTurnStarted(t) ? turnValue : null
           const delivered = sendWhere && deliveredValue && takesDelivered(t) ? deliveredValue : null
           const act = turn && activityValue && takesActivity(t) ? activityValue : null
+          const sub = sendWhere && submitValue && takesSubmit(t) ? submitValue : null
           const base: Record<string, string> = {
             ...withInstance,
             ...(turn ? { turnStartedAt: turn } : {}),
             ...(act ? { activity: act.label, activityAt: new Date(act.at).toISOString() } : {}),
             ...(delivered ? { deliveredMarker: delivered } : {}),
+            ...(sub ? { submit: sub } : {}),
           }
           let reply = await askWithin(t.name, prev ? { ...base, previousSessionId: prev } : base)
           if (reply === TIMED_OUT) return
@@ -997,7 +1229,7 @@ export const register: Register = on => {
           if (answer) {
             lastGood = t.name
             if (withDetails && sending) lastSentTitle = sending
-            if (withDetails) reported = { turn, delivered }
+            if (withDetails) reported = { turn, delivered, submit: sub }
             break
           }
           refused ??= reply
@@ -1006,11 +1238,13 @@ export const register: Register = on => {
         if (answer && reported) {
           if (reported.turn) turnSent = reported.turn
           if (reported.delivered && deliveredPending === reported.delivered) deliveredPending = null
+          if (reported.submit && submitPending === reported.submit) submitPending = null
         }
+        if (stopped) return
         if (!answer) {
           // Say why, and what to allow, instead of going quiet.
           const reason = blockedReason(refused?.text)
-          $.ui.status(`Live on Dashera: paused (${reason}; allow ${found[0]!.name})`)
+          say(`Live on Dashera: paused (${reason}; allow ${found[0]!.name})`)
           // Once per session, when a permission setting is what blocks it,
           // have the agent ask its person for the one-tool rule, so they
           // only say yes (2 Nov 2026: "one-click Live on Dashera").
@@ -1026,7 +1260,7 @@ export const register: Register = on => {
         if (answer.ended) {
           endedPause = true
           sessionCode = null
-          $.ui.status(ENDED_STATUS)
+          say(ENDED_STATUS)
           return
         }
         // Another copy is the one Dashera wakes (0.3.5): stop checking, say
@@ -1035,12 +1269,13 @@ export const register: Register = on => {
         if (answer.standDown === true) {
           if (!standingDown) {
             standingDown = true
-            $.ui.status(STAND_DOWN_STATUS)
+            say(STAND_DOWN_STATUS)
           }
           // The copy Dashera wakes reports this conversation's turns now.
           turnSent = null
           deliveredPending = null
           queuedMarker = null
+          submitPending = null
           activity = null
           probeAt = at + STAND_DOWN_RECHECK_MS
           stillPending = false
@@ -1075,7 +1310,7 @@ export const register: Register = on => {
         const fromDashera = titleFromDashera(answer, title)
         if (fromDashera) pendingTitle = fromDashera
         const label = sessionCode ? ` · ${sessionCode}` : ''
-        $.ui.status(
+        say(
           answer.connected === false
             ? 'Dashera: not connected (paste the connect message to make this a live session)'
             : answer.standingBy
@@ -1103,7 +1338,7 @@ export const register: Register = on => {
               WAKE_MAX_WAIT_MS,
               Math.max(WAKE_DEBOUNCE_MS, lastWakeAt + MIN_GAP_MS - now),
             )
-            $.clock.after(wait, () => void wakeForBurst())
+            after(wait, () => void wakeForBurst())
           }
         }
         // A wake-up held by a turn, or dropped, goes now if it can.
@@ -1136,10 +1371,17 @@ export const register: Register = on => {
         polling = false
       }
     }
-    $.clock.every(POLL_MS, () => void tick())
-    $.clock.after(5_000, () => void tick())
-    // A turn ended: check a second later, so a held wake-up goes at once.
-    checkSoon = () => $.clock.after(1_000, () => void tick())
+    // The checks: every POLL_MS, the first after 5 s. A turn ended: check a
+    // second later, so a held wake-up goes at once.
+    const begin = () => {
+      timers.add($.clock.every(POLL_MS, () => void tick()))
+      after(5_000, () => void tick())
+      checkSoon = () => {
+        if (!stopped) after(1_000, () => void tick())
+      }
+    }
+    if (stopped) onStop()
+    else begin()
     return started
   })
 }
