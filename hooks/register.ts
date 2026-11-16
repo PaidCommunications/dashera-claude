@@ -186,6 +186,23 @@ export const WAKE_MAX_WAIT_MS = 30_000
  * turn that never reported its end holds it no longer than this.
  */
 export const STUCK_TURN_MS = 30 * 60_000
+/**
+ * A main-loop turn with no sign of life (its start, or a tool call of its
+ * own) for this long no longer holds a wake-up (0.3.8): a turn the engine
+ * started and never ran, or never reported ending, held one for 30 minutes.
+ */
+export const TURN_IDLE_MS = 5 * 60_000
+/** What the status line adds when a wake-up goes past such a turn. */
+export const STUCK_NOTE = 'a turn looked stuck; delivering'
+
+/**
+ * Whether a main-loop turn still counts as running (0.3.8): one is open,
+ * it showed a sign of life under TURN_IDLE_MS ago, and it started under
+ * STUCK_TURN_MS ago.
+ */
+export function turnIsLive(open: boolean, since: number, lastSign: number, now: number): boolean {
+  return open && now - lastSign < TURN_IDLE_MS && now - since < STUCK_TURN_MS
+}
 /** A wake-up the engine dropped is asked again no sooner than this. */
 export const RETRY_DROPPED_MS = 30_000
 /** How long a submit may take to answer before it counts as queued. */
@@ -646,6 +663,15 @@ export const register: Register = on => {
   // the prefixes of the Dashera connectors this copy checks through.
   let activity: { label: ActivityLabel; at: number } | null = null
   const dasheraPrefixes = new Set<string>()
+  // The main loop's last sign of life (0.3.8): its turn's start or its
+  // latest tool call, whichever is later.
+  const lastSign = () => Math.max(runningSince, activity?.at ?? Number.NEGATIVE_INFINITY)
+  const turnLive = (now: number) => turnIsLive(running.size > 0, runningSince, lastSign(), now)
+  // A turn that never ran or never reported its end: forgotten.
+  const clearStaleTurn = () => {
+    running.clear()
+    activity = null
+  }
 
   // The owner renamed the session in Dashera: the conversation takes that
   // name at the next prompt Claude Code allows a title on (a wake-up's
@@ -668,8 +694,12 @@ export const register: Register = on => {
   // idle. A subagent's run is part of a turn the main loop already holds.
   on('turn.start', async ($, e, next) => {
     if (e.agentId === undefined) {
+      const now = await $.clock.now()
+      // A new turn after an idle gap (0.3.8): the turns still open from
+      // before it never reported their end, so they are over.
+      if (running.size > 0 && !running.has(e.turnId) && now - lastSign() >= TURN_IDLE_MS) clearStaleTurn()
       if (running.size === 0) {
-        runningSince = await $.clock.now()
+        runningSince = now
         activity = null
         // A wake-up that waited in the engine's queue enters with this turn.
         if (queuedMarker) {
@@ -937,8 +967,16 @@ export const register: Register = on => {
     const deliver = async () => {
       if (!due || delivering || endedPause || !stillPending) return
       const now = await $.clock.now()
-      if (running.size > 0 && now - runningSince < STUCK_TURN_MS) return
+      if (turnLive(now)) return
       if (now < retryAt) return
+      // A turn is open but shows no life (0.3.8): forget it and deliver. The
+      // engine may still be running it (one long command); then it queues
+      // the prompt behind it, and it counts as delivered at the next turn.
+      const pastStale = running.size > 0
+      if (pastStale) {
+        clearStaleTurn()
+        showSubmit(STUCK_NOTE)
+      }
       const d = due
       delivering = true
       try {
@@ -950,7 +988,7 @@ export const register: Register = on => {
           SUBMIT_ANSWER_MS,
         )
         // What became of it, on the status line and to Dashera (0.3.8).
-        await recordDelivery(answer ?? 'queued', 'wake-up')
+        await recordDelivery(answer ?? 'queued', pastStale ? 'a turn looked stuck; wake-up' : 'wake-up')
         // No answer in time: it waits in the engine's queue, which runs it
         // once the session is idle.
         if (answer === 'dropped') {
@@ -960,11 +998,16 @@ export const register: Register = on => {
         // Entered: the next check tells Dashera (0.3.6). Queued: it enters
         // with the next turn, and is told then (a turn that started while
         // the submit was answering is that turn).
-        if (answer === 'entered' || (running.size > 0 && runningSince >= now)) deliveredPending = d.marker
+        // Past a stale turn, "entered" may mean queued behind it: delivered
+        // only once a turn of its own has started.
+        const started = running.size > 0 && runningSince >= now
+        if (started || (answer === 'entered' && !pastStale)) deliveredPending = d.marker
         else queuedMarker = d.marker
         lastMarker = d.marker
         lastWakeAt = now
-        if (due === d) due = null
+        // A burst that re-raised the same marker while this submit was
+        // answering is the same wake-up: done too.
+        if (due === d || due?.marker === d.marker) due = null
       } finally {
         delivering = false
       }
@@ -1129,7 +1172,7 @@ export const register: Register = on => {
         // copy that stands down.
         const turnValue = standingDown
           ? null
-          : turnStartedAtToSend(running.size > 0, runningSince, at, turnSent)
+          : turnStartedAtToSend(turnLive(at), runningSince, at, turnSent)
         const deliveredValue = standingDown ? null : deliveredPending
         const resultValue = standingDown ? null : deliveryPending
         // Activity (0.3.7): only beside a running turn's start, never "none".
@@ -1300,7 +1343,7 @@ export const register: Register = on => {
         // Not connected, and the agent tried to connect it (0.3.5): the
         // note, once per conversation, when the session is idle.
         const conv = where.sessionId
-        if (answer.connected === false && engaged && conv && !notedFor.has(conv) && running.size === 0) {
+        if (answer.connected === false && engaged && conv && !notedFor.has(conv) && !turnLive(at)) {
           const note = notConnectedNote(sessionCode, typeof answer.refused === 'string')
           const tries = noteTries.get(conv) ?? 0
           if (note && tries < NOT_CONNECTED_TRIES) {

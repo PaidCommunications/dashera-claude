@@ -36,12 +36,21 @@ async function live($: Engine, on: On, opts: { drop?: () => boolean } = {}) {
     prompts.push(e.text)
     return { text: e.text }
   })
+  on('tool.call', { tool: 'Read' }, () => ({ result: [{ type: 'text', text: 'ok' }], text: 'ok' }))
   on('ui.status', () => ({ value: undefined }))
   on('turn.start', (_, e) => ({ turnId: e.turnId }))
   on('turn.complete', (_, e) => ({ text: e.answer }))
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
   await clock.advance(6_000)
   return { clock, state, prompts, dropped }
+}
+
+/** A turn at work (0.3.8): a tool call of its own every 2 minutes. */
+async function busyFor($: Engine, clock: { advance: (ms: number) => Promise<unknown> }, ms: number) {
+  for (let left = ms; left > 0; left -= 120_000) {
+    await $.tool.call({ tool: 'Read', file_path: '/w/a.ts' })
+    await clock.advance(Math.min(120_000, left))
+  }
 }
 
 const ORG = '0b6f4a1e-6d2c-4c1b-9f43-2a7d8e5b1c01'
@@ -71,8 +80,8 @@ test('a mention while the session is mid-turn wakes it at its next idle check', 
   const { clock, state, prompts } = await live($, on)
   await $.turn.start({ text: 'build the thing', turnId: 'long-1' })
   state.answer = { pending: true, marker: 'mt1', organizations: ['Example Org'], organizationIds: [ORG] }
-  // A long turn: nothing is pushed into it.
-  await clock.advance(10 * 60_000)
+  // A long turn at work: nothing is pushed into it.
+  await busyFor($, clock, 10 * 60_000)
   expect(prompts).toHaveLength(0)
   await $.turn.complete({ answer: 'done', durationMs: 600_000, isAborted: false, turnId: 'long-1', reason: 'answer' })
   // The next check finds it still pending and the session idle.
@@ -101,13 +110,14 @@ test('a subagent turn does not hold the wake-up', async ($, on) => {
   expect(prompts).toEqual([WAKE])
 })
 
-test('a turn that never reports its end holds the wake-up at most STUCK_TURN_MS', async ($, on) => {
+test('a busy turn that never reports its end holds the wake-up at most STUCK_TURN_MS', async ($, on) => {
   const { clock, state, prompts } = await live($, on)
   await $.turn.start({ text: 'stuck', turnId: 'stuck-1' })
   state.answer = { pending: true, marker: 'st1', organizations: ['Example Org'], organizationIds: [ORG] }
-  await clock.advance(STUCK_TURN_MS - 60_000)
+  // Busy all along (0.3.8: an idle one lets go after TURN_IDLE_MS).
+  await busyFor($, clock, STUCK_TURN_MS - 60_000)
   expect(prompts).toHaveLength(0)
-  await clock.advance(2 * 60_000)
+  await busyFor($, clock, 2 * 60_000)
   expect(prompts).toEqual([WAKE])
 })
 
