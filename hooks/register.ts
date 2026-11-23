@@ -1,6 +1,23 @@
 import type { Register, Timer } from 'claude-code'
 import type { LiveCopyLease } from '../types'
 import { PLUGIN_VERSION } from './version'
+import {
+  COMPACT_REQUEST_PROMPT,
+  COMPACT_TIMEOUT_MS,
+  COMPACT_TRIES,
+  EPOCH_DEDUPE_MS,
+  GROWTH_TURNS,
+  type CompactionReport,
+  categorySplit,
+  compactInstructions,
+  isOwnerOrigin,
+  noticeDue,
+  noticeText,
+  parseCheckpointAnswer,
+  parseEpoch,
+  pointerPrompt,
+  reportText,
+} from './memory'
 
 // Dashera wake-ups (1 Nov 2026). Every 15 seconds (30 until 5 Nov 2026), between turns, ask the
 // Dashera connector's wake_status tool "is anything new waiting for me?".
@@ -496,7 +513,7 @@ export const takesPrevious = (t: { description: string }) => /previousSessionId/
 const isWakeTool = (name: string) => /(^|__)wake_status$/.test(name)
 // The Dashera tools that take this session's code (2 Nov 2026).
 export const takesSession = (name: string) =>
-  /^mcp__.+__(check_in|advance_cursor|name_my_session)$/.test(name)
+  /^mcp__.+__(check_in|advance_cursor|name_my_session|resume_work)$/.test(name)
 
 /**
  * Dashera write tools whose `session` is the caller's own live session code
@@ -509,7 +526,7 @@ export const takesSession = (name: string) =>
  * input schema, so this list must be kept in step with Dashera's tools.
  */
 export const SESSION_WRITE_TOOLS: ReadonlySet<string> = new Set([
-  'act_on_rep_change', 'add_bot_document', 'add_email_image', 'add_email_image_from_url',
+  'act_on_rep_change', 'add_bot_document', 'checkpoint_work', 'add_email_image', 'add_email_image_from_url',
   'add_hr_note', 'add_project_member', 'approve_my_playbook', 'approve_spif_payouts',
   'archive_crm_account', 'archive_project', 'archive_thread', 'build_accept_review_round',
   'build_approve_plan', 'build_cancel_review_round', 'build_create_list', 'build_create_room',
@@ -821,6 +838,14 @@ export const register: Register = on => {
   const burstOrgs: string[] = []
   let stillPending = false
   let sessionCode: string | null = null
+  // Session memory (0.3.10): the context-full note on the status line, and
+  // how to show the status line again; the compaction handler, for the
+  // SessionStart fallback.
+  let contextNote: string | null = null
+  let sayAgain: (() => void) | null = null
+  let afterCompaction:
+    | ((c: { source: string; compactionId?: string; tokensBefore?: number; tokensAfter?: number }) => Promise<void>)
+    | null = null
   // Filling session on writes (0.3.9): the prefix of the connector whose
   // check gave the code, whether that check said connected, the Dashera
   // connectors the tool list shows, whether a sessionWarning was shown in
@@ -933,6 +958,7 @@ export const register: Register = on => {
       if (running.size === 0) {
         runningSince = now
         activity = null
+        await memoryTurnStart?.()
         // A wake-up that waited in the engine's queue enters with this turn.
         if (queuedMarker) {
           deliveredPending = queuedMarker
@@ -949,6 +975,9 @@ export const register: Register = on => {
       activity = null
       // Idle again: check now rather than at the next tick.
       checkSoon?.()
+      // Session memory (0.3.10): after the turn has ended, never in it.
+      ownerTurn = false
+      $.clock.after(MEMORY_AFTER_TURN_MS, () => void memoryAfterTurn?.())
     }
     return next(e)
   }).catch(($, e, next) => next(e))
@@ -956,6 +985,9 @@ export const register: Register = on => {
     // A resumed conversation (continuity): it may go on under a new id.
     // Only a resume: a compact keeps the id, a fork is a new conversation.
     const c = e as { source?: string; transcript_path?: string }
+    // Session memory (0.3.10): the fallback signal that a compaction
+    // happened, where the session.compact hook didn't fire for it.
+    if (c.source === 'compact') void afterCompaction?.({ source: 'compact (session start)' })
     if (c.source === 'resume') {
       resumed = true
       if (typeof c.transcript_path === 'string' && c.transcript_path) resumedTranscript = c.transcript_path
@@ -982,6 +1014,11 @@ export const register: Register = on => {
   on('tool.check', async ($, e, next) => {
     if (isWakeTool(e.tool) && next.origin?.plugin === $.plugin.name) {
       return { decision: 'allow', reason: 'Live on Dashera check (yes or no only)' }
+    }
+    // Session memory (0.3.10): this plugin's own report of a compaction to
+    // its own session's memory (resume_work), never the model's calls.
+    if (/^mcp__.+__resume_work$/.test(e.tool) && next.origin?.plugin === $.plugin.name) {
+      return { decision: 'allow', reason: 'Dashera session memory: report a compaction' }
     }
     return next(e)
   }).catch(($, e, next) =>
@@ -1010,6 +1047,7 @@ export const register: Register = on => {
   // writes that only move forward or set a name), so when an old tool list
   // refuses the argument the call goes on as the agent wrote it.
   on('tool.call', async ($, e, next) => {
+    const r = await (async () => {
     const args = e as unknown as Record<string, unknown>
     // The model connecting this conversation itself (0.3.5); never this
     // plugin's own checks.
@@ -1044,10 +1082,308 @@ export const register: Register = on => {
       // Refused before it ran: send it as written below.
     }
     return next(e)
+    })()
+    return memoryAfterCall ? ((await memoryAfterCall(e, next, r)) as typeof r) : r
   }).catch(($, e, next) => next(e))
+
+  // ---- Session memory (0.3.10, Dashera Session memory 1) ----
+  // See hooks/memory.ts. State: whether the running main-loop turn is the
+  // owner's (a prompt the person typed started it), whether the next one
+  // will be, /dashera-compact's arming, the compaction Dashera confirmed,
+  // the ones already handled, the epoch Dashera last gave, when it last
+  // advanced (the two compaction signals are one), the notice's place, and
+  // the latest compaction's report.
+  let ownerTurn = false
+  let nextTurnOwner = false
+  let commandArmedAt = Number.NEGATIVE_INFINITY
+  const COMMAND_ARM_MS = 10 * 60_000
+  let pendingCompaction: { id: string; checkpointId: string; version: number; tries: number } | null = null
+  let compacting = false
+  const handledCompactions = new Set<string>()
+  let epoch: number | null = null
+  let lastAdvanceAt = Number.NEGATIVE_INFINITY
+  let noticeBaseline: number | null = null
+  let noticeLast: number | null = null
+  let report: CompactionReport | null = null
+  let sampling = false
+  let memoryTurnStart: (() => Promise<void>) | null = null
+  let memoryAfterCall: ((e: { tool: string; agentId?: string }, next: unknown, r: unknown) => Promise<unknown>) | null = null
+  let memoryAfterTurn: (() => Promise<void>) | null = null
+  let compactNow: (() => Promise<void>) | null = null
+  let submitCompactRequest: (() => void) | null = null
+  /** The memory work after a turn waits this long, so it runs outside the turn. */
+  const MEMORY_AFTER_TURN_MS = 1_000
+
+  // Whose turn this is: a prompt the person typed (composer, Remote
+  // Control) makes the next turn, or the running one, the owner's; anything
+  // else delivered into a running turn takes that away.
+  on('prompt.submit', async ($, e, next) => {
+    const owner = isOwnerOrigin((e as { origin?: unknown }).origin)
+    if ((e as { turnId?: string }).turnId !== undefined) ownerTurn = ownerTurn && owner ? true : owner
+    else nextTurnOwner = owner
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
+  on('command.run', { command: 'dashera-compact' }, async ($, e) => {
+    if (/^\s*report\s*$/i.test(e.args)) return { text: reportText(report) }
+    if (!isOwnerOrigin(e.origin)) return { text: 'Only the owner can run /dashera-compact.' }
+    if (!sessionCode) return { text: 'This conversation is not a connected Dashera session, so there is nothing to save to. Nothing was compacted.' }
+    if (pendingCompaction || compacting) return { text: 'A compaction is already waiting for this turn to end. Nothing new was started.' }
+    commandArmedAt = await $.clock.now()
+    submitCompactRequest?.()
+    return { text: 'Saving this session to Dashera. It compacts when Dashera confirms the checkpoint and the turn ends.' }
+  }).catch(() => ({ text: 'Dashera: /dashera-compact failed before it started. Nothing was compacted.' }))
+
+
+  // At each idle turn end: compact if Dashera confirmed one; then read the
+  // real size for the notice and the growth report. Never during a turn.
+
+  // Any compaction of the main conversation (the owner's /compact, the
+  // runtime's own, another plugin's): the epoch advances after it, and the
+  // pointer turn starts. Never a veto, never waiting on Dashera.
+  on('session.compact', async ($, e, next) => {
+    const r = await next(e)
+    if (e.agentId === undefined && e.trigger !== 'precompute' && !('skip' in r && r.skip !== undefined)) {
+      const done = r as { tokensBefore?: number; tokensAfter?: number }
+      void afterCompaction?.({ source: e.trigger, tokensBefore: done.tokensBefore, tokensAfter: done.tokensAfter }).catch(() => undefined)
+    }
+    return r
+  }).catch(($, e, next) => next(e))
+
 
   on('session.start', async ($, e, next) => {
     const started = await next(e)
+    // Session memory (0.3.10): /dashera-compact. Registering again replaces it.
+    try {
+      await $.command.register({
+        name: 'dashera-compact',
+        description: 'Save this session to Dashera, then compact it (report: the last compaction)',
+        argumentHint: '[report]',
+      })
+    } catch {
+      // An engine without registered commands: the owner's words still work.
+    }
+    // Session memory (0.3.10): its closures use this start's $.
+    submitCompactRequest = () => {
+      // Fixed text, no data: a turn that saves the checkpoint, once the
+      // command has answered.
+      $.clock.after(250, () => void $.prompt.submit({ text: COMPACT_REQUEST_PROMPT }).catch(() => undefined))
+    }
+    const later = <T,>(p: Promise<T>, ms: number): Promise<T | 'timeout'> =>
+      Promise.race([p, new Promise<'timeout'>(r => void $.clock.after(ms, () => r('timeout')))])
+    // A call to this conversation's own Dashera connector (the one whose
+    // check gave the code). Null when there is none or it failed.
+    const callDashera = async (tool: string, args: Record<string, unknown>): Promise<string | null> => {
+      const prefix = codePrefix
+      if (!prefix || !sessionCode) return null
+      const server = prefix.replace(/^mcp__/, '').replace(/__$/, '')
+      try {
+        const r = await $.mcp.call(server, tool, args)
+        if (r.isError) return null
+        return r.content.map(b => ((b as { type?: string }).type === 'text' ? (b as { text: string }).text : '')).join('\n')
+      } catch {
+        try {
+          const r = await $.tool.call({ tool: `${prefix}${tool}` as `mcp__${string}__${string}`, ...args } as {
+            tool: `mcp__${string}__${string}`
+          })
+          return r.deny !== undefined || r.isError ? null : (r.text ?? null)
+        } catch {
+          return null
+        }
+      }
+    }
+    const usageOf = async (breakdown = false) => {
+      try {
+        const u = await later(breakdown ? $.session.usage({ breakdown: 'summary' }) : $.session.usage(), 5000)
+        return u === 'timeout' ? null : u
+      } catch {
+        return null
+      }
+    }
+    const reportCompaction = async (id: string, status: string, extra: Record<string, unknown> = {}) => {
+      if (!sessionCode) return
+      for (let i = 0; i < 3; i++) {
+        const r = await later(callDashera('resume_work', { session: sessionCode, compaction: { id, status, ...extra } }), 15_000)
+        if (r !== 'timeout' && r !== null) return
+      }
+    }
+
+    afterCompaction = async c => {
+      const now = await $.clock.now()
+      // Both signals (the hook and SessionStart "compact") for one
+      // compaction: the epoch advances once.
+      if (now - lastAdvanceAt < EPOCH_DEDUPE_MS) return
+      lastAdvanceAt = now
+      const code = sessionCode
+      const after = await usageOf(true)
+      const tokensAfter = c.tokensAfter ?? after?.context.tokens
+      report = {
+        code,
+        epoch: null,
+        source: c.source,
+        before: c.tokensBefore ?? 'unknown',
+        after: tokensAfter ?? 'unknown',
+        window: after?.context.window ?? 'unknown',
+        split: categorySplit(after?.context.breakdown),
+        dashera: { playbookAndRules: 'unknown', playbook: 'unknown', card: 'unknown' },
+        samples: [],
+      }
+      sampling = true
+      noticeBaseline = tokensAfter ?? null
+      noticeLast = null
+      contextNote = null
+      sayAgain?.()
+      if (!code) return
+      const op = `ctx-${now.toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+      let answer: string | null = null
+      for (let i = 0; i < 3 && answer === null; i++) {
+        const r = await later(
+          callDashera('resume_work', {
+            session: code,
+            newContext: true,
+            contextOperation: op,
+            ...(typeof tokensAfter === 'number' ? { contextTokens: tokensAfter } : {}),
+            ...(c.compactionId
+              ? {
+                  compaction: {
+                    id: c.compactionId,
+                    status: 'done',
+                    ...(typeof c.tokensBefore === 'number' ? { tokensBefore: c.tokensBefore } : {}),
+                    ...(typeof tokensAfter === 'number' ? { tokensAfter } : {}),
+                  },
+                }
+              : {}),
+          }),
+          15_000,
+        )
+        answer = r === 'timeout' ? null : r
+      }
+      const n = parseEpoch(answer ?? undefined)
+      if (n !== null) epoch = n
+      if (report) report.epoch = epoch
+      // Only the fixed pointer, never anything Dashera or the session wrote.
+      void $.prompt.submit({ text: pointerPrompt(code, n) }).catch(() => undefined)
+    }
+
+    compactNow = async () => {
+      const p = pendingCompaction
+      if (!p || compacting || !sessionCode) return
+      compacting = true
+      try {
+        const before = await usageOf()
+        let r: Awaited<ReturnType<typeof $.session.compact>> | 'timeout'
+        try {
+          r = await later($.session.compact({ instructions: compactInstructions(sessionCode, p.checkpointId, p.version) }), COMPACT_TIMEOUT_MS)
+        } catch (err) {
+          // Rejected (a turn running, or no compaction here): never forced.
+          p.tries += 1
+          if (p.tries >= COMPACT_TRIES) {
+            pendingCompaction = null
+            handledCompactions.add(p.id)
+            await reportCompaction(p.id, 'failed', { detail: String(err instanceof Error ? err.message : err).slice(0, 160) })
+          }
+          return
+        }
+        pendingCompaction = null
+        handledCompactions.add(p.id)
+        if (r === 'timeout') {
+          await reportCompaction(p.id, 'unknown', { detail: 'no answer within 10 minutes' })
+          return
+        }
+        if ('skip' in r && typeof r.skip === 'string') {
+          await reportCompaction(p.id, 'vetoed', { detail: r.skip.slice(0, 160) })
+          return
+        }
+        const done = r as { tokensBefore?: number; tokensAfter?: number }
+        await afterCompaction?.({
+          source: 'dashera-compact',
+          compactionId: p.id,
+          tokensBefore: done.tokensBefore ?? before?.context.tokens,
+          tokensAfter: done.tokensAfter,
+        })
+      } finally {
+        compacting = false
+      }
+    }
+
+    memoryTurnStart = async () => {
+      const now = await $.clock.now()
+      ownerTurn = nextTurnOwner || now - commandArmedAt < COMMAND_ARM_MS
+      nextTurnOwner = false
+    }
+    memoryAfterCall = async (e, callNext, r) => {
+      try {
+        const s = splitMcpName(e.tool)
+        const origin = (callNext as { origin?: { plugin?: string } }).origin
+        if (!s || !codePrefix || s.prefix !== codePrefix || origin?.plugin === $.plugin.name) return r
+        const text = (r as { text?: string }).text
+        const failed = (r as { isError?: boolean; deny?: string }).isError === true || (r as { deny?: string }).deny !== undefined
+        // Dashera's own answers in the new context, by size only.
+        if (report && sampling && !failed && typeof text === 'string') {
+          if (s.tool === 'check_in' && report.dashera.playbookAndRules === 'unknown') {
+            const owner = /<from_your_owner>[\s\S]*?<\/from_your_owner>/.exec(text)
+            report.dashera.playbookAndRules = owner ? owner[0].length : 'unknown'
+          }
+          if (s.tool === 'get_playbook' && report.dashera.playbook === 'unknown') report.dashera.playbook = text.length
+          if (s.tool === 'resume_work' && report.dashera.card === 'unknown' && /"delivery"\s*:\s*"full"/.test(text)) report.dashera.card = text.length
+        }
+        const args = e as unknown as Record<string, unknown>
+        if (s.tool !== 'checkpoint_work' || args.compactAfter !== true) return r
+        const confirmed = failed ? null : parseCheckpointAnswer(text)
+        if (!confirmed || !confirmed.checkpointId || !confirmed.compactionId || confirmed.compactionStatus !== 'pending') {
+          // No confirmation, no compaction.
+          if (!confirmed || confirmed.compactionStatus !== 'not_supported') {
+            contextNote = 'Dashera: checkpoint not confirmed, not compacting'
+            sayAgain?.()
+          }
+          return r
+        }
+        if (handledCompactions.has(confirmed.compactionId)) return r
+        if (pendingCompaction?.id === confirmed.compactionId) return r
+        const now = await $.clock.now()
+        const byOwner = e.agentId === undefined && (ownerTurn || now - commandArmedAt < COMMAND_ARM_MS)
+        if (!byOwner) {
+          handledCompactions.add(confirmed.compactionId)
+          void reportCompaction(confirmed.compactionId, 'vetoed', {
+            detail: e.agentId !== undefined ? 'not_owner: a subagent asked' : 'not_owner: the turn was not started by the owner',
+          })
+          return r
+        }
+        // The repeat's no-op answer names the pending one; its version comes
+        // from the save that made it, so only a fresh confirmation arms it.
+        if (confirmed.version === null) return r
+        pendingCompaction = { id: confirmed.compactionId, checkpointId: confirmed.checkpointId, version: confirmed.version, tries: 0 }
+        commandArmedAt = Number.NEGATIVE_INFINITY
+      } catch {
+        // Never in the way of the call's own result.
+      }
+      return r
+    }
+    memoryAfterTurn = async () => {
+      if (running.size > 0) return
+      try {
+        if (pendingCompaction) {
+          await compactNow?.()
+          return
+        }
+        const u = await usageOf()
+        const tokens = u?.context.tokens ?? null
+        if (tokens === null) return
+        if (report && sampling && typeof report.after === 'number') {
+          report.samples.push(tokens)
+          if (report.samples.length >= GROWTH_TURNS) sampling = false
+        }
+        const window = u?.context.window ?? null
+        if (noticeDue(tokens, window, noticeBaseline, noticeLast)) {
+          noticeLast = tokens
+          contextNote = noticeText(tokens, u?.context.percent ?? null)
+          sayAgain?.()
+        }
+      } catch {
+        // The size is unknown this time; nothing is shown.
+      }
+    }
+
     // Another start in this load (0.3.8): the interval already runs; never a
     // second one beside it.
     if (interval) return started
@@ -1184,7 +1520,11 @@ export const register: Register = on => {
     let submitClear: Timer | null = null
     const say = (text: string) => {
       shown = text
-      void $.ui.status(submitNote ? `${text} · ${submitNote}` : text)
+      const parts = [text, ...(contextNote ? [contextNote] : []), ...(submitNote ? [submitNote] : [])]
+      void $.ui.status(parts.join(' · '))
+    }
+    sayAgain = () => {
+      if (shown) say(shown)
     }
     // The lease's writes; null when $.state can't be read (then this copy
     // checks as it always did).
