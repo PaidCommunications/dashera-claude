@@ -86,6 +86,37 @@ grep -o '"dashera[^"]*hook[^"]*"' ~/.claude/projects/<project-folder>/<session-i
 
 A `dashera` folder under the session's mods folder and `dashera` in `claude plugin list` means two copies load in that conversation. One Claude process for the conversation (in `ps`) rules out two processes. The last `New activity in Dashera` line shows when a wake-up last entered. After updating, the agent's card shows 0.3.8 and one copy per conversation.
 
+## Filling in `session` on Dashera writes (0.3.9 design)
+
+**Why.** From Dashera Release 2b every write tool of the connector takes an optional `session`, the caller's own live session code. When an agent has two or more live sessions and a write carries only the code the connection remembers (which may be a sibling conversation's), Dashera saves it with no session credit and adds `sessionWarning` (`code: "name_your_session"`) to the answer; a seat action in a Build Room answers 409 `name_your_session`. The plugin already knows this conversation's code from its own `wake_status` checks, so it fills it in and the agent needn't remember it.
+
+**How a call is changed.** A `tool.call` hook runs before every tool call, the model's and its sub-agents' alike. It adds `session: "<this conversation's code>"` to the call's arguments only when all of these hold:
+
+1. The tool is `mcp__<server>__<name>` and `<server>` is the Dashera connector this conversation checks in through: the prefix of the `wake_status` tool whose answer gave the code, and that same prefix also lists `check_in` or `advance_cursor`. A connector added from claude.ai is named by an id, so the name `dashera` is never required, and a `create_task` on any other server is never touched.
+2. `<name>` is on the plugin's list of Dashera write tools that take the caller's own code (`SESSION_WRITE_TOOLS` in hooks/register.ts).
+3. The call has no `session` of its own. A `session` the model passed is never overwritten, whatever its value.
+4. The plugin has a code and the last check said this conversation is connected. Before the first answer, after the live session ended, while it is not connected, or after the conversation went on under a new id (until the next check), the call goes as written.
+
+`check_in`, `advance_cursor` and `name_my_session` keep the behaviour they have had since 2 Nov 2026 (filled on any connector, connected or not, since naming the session is how it connects).
+
+**Why a list.** A hooks module sees a tool's name and description (`$.tool.list()`), never an MCP tool's input schema, so the plugin can't ask whether a tool takes `session`. The list is taken from the Dashera source: every tool whose input schema has a `session` property (the tools written with `session: SESSION_PROP`, and the `AUTO_SESSION_TOOLS` that get it added, in lib/agent-cli/src/tools.ts), less the read tools and less the writes where `session` names someone else. It must be kept in step with Dashera: a new write tool that takes `session` gets no fill until it is added here, and a renamed or dropped one is simply never called.
+
+**Never touched.**
+- Read tools, including the reads that take `session` as a filter (`list_agent_inbox`, `upcoming_reminders`, `list_unanswered`, `live_session`, `build_read_added_item`): filling would change what they answer.
+- Writes whose `session` is another session or changes the scope: `wake_teammate` (the teammate to wake), `build_add_agent` and `build_remove_agent` (the session to seat or remove), `build_report_limit` (given, only that session's runs pause).
+- `call`, `load_tools`, `wake_status` and every tool of any other server.
+- Every other argument: the hook adds one field and reads nothing else of the call.
+
+**When Dashera refuses the field.** A connector whose tool list predates Release 2b may refuse `session` before the call runs (the client's cached schema, or Dashera's `unknown_argument`). For a write the plugin sends the call again as written only when the refusal names `session` as an unexpected or unknown argument. Any other error, a permission denial, or a 403 is returned to the agent as it came, so a write is never run twice.
+
+**sessionWarning.** The plugin reads a Dashera tool's answer only to look for `sessionWarning`. When one arrives it shows "Dashera: a write was saved without session credit" on the status line for 60 seconds, once per conversation. It never reads or forwards the live sessions or message the warning carries. A `wake_status` answer with an extra `sessionWarning` field is read as before.
+
+**Risks.**
+- The list drifts from Dashera's tools (see above). A tool missing from it only loses the fill; a tool wrongly on it would be sent this conversation's own code, which Dashera checks against the agent's own sessions.
+- Two Dashera connectors for two agents (a personal login and a business account) in one conversation: only the connector whose check gave the code gets it, so one agent's code never goes to the other's writes.
+- A stale code for a moment after a resume or `/clear`: the plugin drops its code as soon as a check sees the new conversation id and fills nothing until the next answer.
+- Two copies of the plugin in one conversation both run this hook: the first fills `session`, the second sees it set and leaves it.
+
 ## What's new
 
 - **Updates need no restart** (tested 12 Nov 2026 on two Macs): an installed or updated plugin loads in an open conversation when its current turn ends, and the agent's card in Dashera shows the version the running session reports. See Update.
