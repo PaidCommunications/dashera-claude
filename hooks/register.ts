@@ -110,6 +110,18 @@ import { PLUGIN_VERSION } from './version'
 //    lease and report deliveryBroken, so another copy, or the owner's alert,
 //    takes over.
 
+// Session on writes (0.3.9, 23 Nov 2026, Dashera Release 2b): every write
+// tool takes `session`, the caller's own live session code; with two or
+// more live sessions a write that carries only the connection's remembered
+// code is saved without session credit and answers sessionWarning
+// (name_your_session), and a Build Room seat action answers 409. The
+// tool.call hook fills this conversation's code on the listed write tools
+// (SESSION_WRITE_TOOLS) of the connector whose check gave it, while it is
+// connected, when the call leaves session out. Never on reads, other
+// servers, a session the model passed, or writes whose session names
+// another session (NEVER_FILL). A sessionWarning in a Dashera answer shows
+// once on the status line. Design: README, "Filling in session".
+
 // Rename sync (0.2.14, Julian, 7 Nov 2026): the check also carries this
 // conversation's title when it changed, read from the tail of the
 // conversation's transcript (never its content), so the session's name in
@@ -426,6 +438,149 @@ const isWakeTool = (name: string) => /(^|__)wake_status$/.test(name)
 export const takesSession = (name: string) =>
   /^mcp__.+__(check_in|advance_cursor|name_my_session)$/.test(name)
 
+/**
+ * Dashera write tools whose `session` is the caller's own live session code
+ * (0.3.9, Release 2b): the plugin fills it in when the call leaves it out.
+ * Taken from Dashera's lib/agent-cli/src/tools.ts (every tool whose input
+ * schema has `session`: `session: SESSION_PROP` and AUTO_SESSION_TOOLS),
+ * less the reads and less the writes where `session` names another session
+ * or narrows the scope (NEVER_FILL). A hooks module never sees an MCP tool's
+ * input schema, so this list must be kept in step with Dashera's tools.
+ */
+export const SESSION_WRITE_TOOLS: ReadonlySet<string> = new Set([
+  'act_on_rep_change', 'add_bot_document', 'add_email_image', 'add_email_image_from_url',
+  'add_hr_note', 'add_project_member', 'approve_my_playbook', 'approve_spif_payouts',
+  'archive_crm_account', 'archive_project', 'archive_thread', 'build_accept_review_round',
+  'build_approve_plan', 'build_cancel_review_round', 'build_create_list', 'build_create_room',
+  'build_hand_off', 'build_import_items', 'build_join_room', 'build_pause_scheduled_run',
+  'build_post_checklist', 'build_propose_scheduled_run', 'build_record_checklist_reply',
+  'build_record_decision', 'build_rename_room', 'build_report_access', 'build_report_env_names',
+  'build_report_push', 'build_report_review', 'build_report_scheduled_run',
+  'build_request_plan_changes', 'build_request_sessions', 'build_schedule_run',
+  'build_scheduled_run_action', 'build_scheduled_run_settings', 'build_set_brief',
+  'build_set_job_titles', 'build_set_lead', 'build_set_qa_seat', 'build_set_role_brief',
+  'build_set_services', 'build_set_switch', 'build_start_task', 'build_status',
+  'build_sync_conversation', 'build_tick_checklist_item', 'build_tick_import_step',
+  'build_update_decision', 'build_update_service', 'cancel_scheduled_email_campaign',
+  'close_old_tasks', 'comment_on_task', 'comment_on_task_list', 'complete_task',
+  'create_calendar_event', 'create_doc', 'create_email_template', 'create_project', 'create_sheet',
+  'create_task', 'create_task_list', 'create_thread', 'create_ticket', 'delete_calendar_event',
+  'delete_crm_account', 'delete_crm_contact', 'delete_crm_product', 'delete_crm_records',
+  'delete_deal', 'delete_email_template', 'delete_file', 'delete_knowledge_note',
+  'delete_my_message', 'delete_project', 'delete_promotion', 'delete_task', 'delete_task_list',
+  'delete_thread', 'dismiss_reminder', 'draft_agent_email', 'duplicate_email_template',
+  'edit_my_post', 'export_organization', 'extend_invite', 'flag_knowledge_note',
+  'hand_off_session', 'import_rep_history', 'invite_to_project', 'link_crm_accounts_to_project',
+  'log_crm_activities', 'log_time', 'mark_agent_email_read', 'move_deal', 'open_direct_message',
+  'pause_import_run', 'plan_today', 'post_channel_message', 'post_progress',
+  'preview_email_template', 'preview_import', 'record_crm_orders', 'record_crm_store_counts',
+  'record_spif_funding', 'reply_to_ticket', 'report_reminder_result', 'request_connection',
+  'request_from_owner', 'resend_invite', 'restore_from_trash', 'restore_thread',
+  'resume_import_run', 'revoke_invite', 'run_crm_data_connection', 'run_import',
+  'schedule_email_campaign', 'send_email_campaign', 'send_email_template_test',
+  'send_reorder_link', 'set_channel_fees', 'set_crm_connection_settings', 'set_crm_dashboard',
+  'set_crm_data_connection', 'set_crm_sample_settings', 'set_email_theme', 'set_goals',
+  'set_my_work_pins', 'set_not_a_rep', 'set_order_line_sold_by', 'set_price_agreement_term',
+  'set_product_costs', 'set_rep_change_settings', 'set_report_schedule', 'set_thread_historical',
+  'set_ticket_visibility', 'snooze_reminder', 'split_goal', 'start_timer', 'stop_timer',
+  'undo_import', 'update_calendar_event', 'update_doc', 'update_email_template',
+  'update_invite_role', 'update_knowledge_note', 'update_project', 'update_sheet_rows',
+  'update_task', 'update_task_list', 'update_ticket', 'upload_file', 'upsert_crm_accounts',
+  'upsert_crm_contacts', 'upsert_crm_inventory', 'upsert_crm_products', 'upsert_crm_shipments',
+  'upsert_deals', 'upsert_price_agreements', 'upsert_price_tiers', 'upsert_promotions',
+  'upsert_spifs', 'upsert_teams'
+])
+/** Dashera tools whose `session` is never filled (another session, a scope, a filter). */
+export const NEVER_FILL: ReadonlySet<string> = new Set([
+  'wake_teammate', 'build_add_agent', 'build_remove_agent', 'build_report_limit',
+  'list_agent_inbox', 'upcoming_reminders', 'list_unanswered', 'live_session',
+  'build_read_added_item', 'call', 'load_tools', 'wake_status',
+])
+
+/** `mcp__<server>__` and the tool's own name, or null for a tool of no MCP server. */
+export function splitMcpName(name: string): { prefix: string; tool: string } | null {
+  const m = /^(mcp__.+__)([A-Za-z0-9_-]+)$/.exec(name)
+  return m ? { prefix: m[1]!, tool: m[2]! } : null
+}
+
+/**
+ * The Dashera connectors among the session's tools (0.3.9): each prefix that
+ * lists `wake_status` and also `check_in` or `advance_cursor`.
+ */
+export function dasheraConnectors(names: Iterable<string>): Set<string> {
+  const byPrefix = new Map<string, Set<string>>()
+  for (const n of names) {
+    const s = splitMcpName(n)
+    if (!s) continue
+    let set = byPrefix.get(s.prefix)
+    if (!set) byPrefix.set(s.prefix, (set = new Set()))
+    set.add(s.tool)
+  }
+  const out = new Set<string>()
+  for (const [p, t] of byPrefix) if (t.has('wake_status') && (t.has('check_in') || t.has('advance_cursor'))) out.add(p)
+  return out
+}
+
+/** What the fill needs to know of this conversation's live session (0.3.9). */
+export type LiveSession = {
+  code: string | null
+  /** The `mcp__<server>__` prefix of the wake_status tool whose answer gave the code. */
+  prefix: string | null
+  connected: boolean
+  connectors: ReadonlySet<string>
+}
+
+/**
+ * Whether a write call gets this conversation's code (0.3.9): a listed
+ * write tool of the very connector whose check gave the code, that
+ * connector recognised as Dashera, the conversation connected, and no
+ * `session` in the call.
+ */
+export function fillsWriteSession(tool: string, args: Record<string, unknown>, live: LiveSession): boolean {
+  if (!live.code || !live.prefix || !live.connected || !live.connectors.has(live.prefix)) return false
+  if ('session' in args && args.session !== undefined) return false
+  const s = splitMcpName(tool)
+  if (!s || s.prefix !== live.prefix) return false
+  return SESSION_WRITE_TOOLS.has(s.tool) && !NEVER_FILL.has(s.tool)
+}
+
+/**
+ * A refusal of the `session` argument itself, before the call ran (0.3.9):
+ * a cached schema's "unexpected parameter `session`", a validator's
+ * "unrecognized key", or Dashera's unknown_argument naming session. Only
+ * then is a write sent again as written; any other error stands.
+ */
+export function refusedSessionArg(r: { deny?: string; isError?: boolean; text?: string }): boolean {
+  const failed = r.deny !== undefined || r.isError === true
+  const t = r.deny ?? r.text ?? ''
+  return (
+    failed &&
+    /\bsession\b/i.test(t) &&
+    /(unexpected|unrecogni[sz]ed|unknown|additional)[ _-]?(parameters?|arguments?|propert|keys?|fields?)/i.test(t)
+  )
+}
+
+/** sessionWarning's code in a Dashera answer (0.3.9), or null. Nothing else of it is read. */
+export function sessionWarningCode(text: string | undefined): string | null {
+  if (!text || !text.includes('sessionWarning')) return null
+  const start = text.indexOf('{')
+  const end = text.lastIndexOf('}')
+  if (start >= 0 && end > start) {
+    try {
+      const w = (JSON.parse(text.slice(start, end + 1)) as { sessionWarning?: { code?: unknown } }).sessionWarning
+      if (w && typeof w === 'object') {
+        return typeof w.code === 'string' && /^[a-z_]{1,40}$/.test(w.code) ? w.code : 'unknown'
+      }
+    } catch {
+      // Not one JSON object: look for the field itself.
+    }
+  }
+  const m = /"sessionWarning"\s*:\s*\{\s*"code"\s*:\s*"([a-z_]{1,40})"/.exec(text)
+  return m ? m[1]! : /"sessionWarning"\s*:\s*\{/.test(text) ? 'unknown' : null
+}
+/** What the status line says, once per conversation, when a write lost its session credit. */
+export const SESSION_WARNING_NOTE = 'Dashera: a write was saved without session credit'
+
 // A chat app whose cached tool list predates `session` refuses the extra
 // argument before the call runs.
 export function refusedSession(r: { isError?: boolean; text?: string }): boolean {
@@ -604,6 +759,15 @@ export const register: Register = on => {
   const burstOrgs: string[] = []
   let stillPending = false
   let sessionCode: string | null = null
+  // Filling session on writes (0.3.9): the prefix of the connector whose
+  // check gave the code, whether that check said connected, the Dashera
+  // connectors the tool list shows, whether a sessionWarning was shown in
+  // this conversation, and how to show it (set at session.start).
+  let codePrefix: string | null = null
+  let codeConnected = false
+  let connectors: ReadonlySet<string> = new Set()
+  let sessionWarned = false
+  let showWarning: ((note: string) => void) | null = null
   // Rename sync (0.2.14): this conversation's title as its transcript last
   // said, the title last sent to Dashera, and a name the owner gave the
   // session in Dashera, waiting to go on this conversation.
@@ -757,6 +921,22 @@ export const register: Register = on => {
     next(e),
   )
 
+  // A Dashera answer that says a write lost its session credit (0.3.9): on
+  // the status line once per conversation. Only the field's presence is
+  // read; the result goes back exactly as it came.
+  const noteWarning = <R,>(r: R): R => {
+    try {
+      const text = (r as { text?: unknown }).text
+      if (!sessionWarned && typeof text === 'string' && sessionWarningCode(text) && showWarning) {
+        sessionWarned = true
+        showWarning(SESSION_WARNING_NOTE)
+      }
+    } catch {
+      // Never in the way of the result.
+    }
+    return r
+  }
+
   // Fill in this session's code on the tools that take it, so the agent
   // needn't remember it. All three are safe to send again (a read, and two
   // writes that only move forward or set a name), so when an old tool list
@@ -776,7 +956,19 @@ export const register: Register = on => {
         // No label this time; the call goes on as usual.
       }
     }
-    if (!sessionCode || !takesSession(e.tool) || typeof args.session === 'string') return next(e)
+    // Dashera writes (0.3.9): this conversation's own code when the call
+    // leaves session out. Resent as written only when the field itself was
+    // refused before the call ran, so a write never runs twice.
+    const live: LiveSession = { code: sessionCode, prefix: codePrefix, connected: codeConnected, connectors }
+    if (fillsWriteSession(e.tool, args, live)) {
+      const r = await next({ ...e, session: live.code } as typeof e)
+      if (refusedSessionArg(r as { deny?: string; isError?: boolean; text?: string })) return noteWarning(await next(e))
+      return noteWarning(r)
+    }
+    if (!sessionCode || !takesSession(e.tool) || typeof args.session === 'string') {
+      const prefix = splitMcpName(e.tool)?.prefix
+      return prefix && connectors.has(prefix) ? noteWarning(await next(e)) : next(e)
+    }
     try {
       const r = await next({ ...e, session: sessionCode } as typeof e)
       if (!('deny' in r && r.deny !== undefined) && !refusedSession(r)) return r
@@ -935,6 +1127,8 @@ export const register: Register = on => {
       const held = await within($.state.get(LEASE), 2000)
       if (held && held.value?.instance === instance) await writeLease(RELEASED, held.version)
     }
+    // A sessionWarning shows like a submit result, for SUBMIT_SHOWN_MS (0.3.9).
+    showWarning = note => showSubmit(note)
     const showSubmit = (note: string) => {
       submitNote = note
       say(shown ?? 'Live on Dashera')
@@ -1084,6 +1278,8 @@ export const register: Register = on => {
           titleReadAt = Number.NEGATIVE_INFINITY
           lastSentTitle = null
           sessionCode = null
+          codePrefix = null
+          codeConnected = false
         }
         // Resumed in a new process: the id this conversation itself last
         // connected under, read from its own transcript. Never the folder's.
@@ -1113,6 +1309,9 @@ export const register: Register = on => {
         }
         const tools = await $.tool.list()
         const found = wakeTools(tools, lastGood)
+        // The Dashera connectors (0.3.9): a wake_status beside check_in or
+        // advance_cursor under one prefix.
+        connectors = dasheraConnectors(tools.map(t => t.name))
         // The Dashera connectors' prefixes, so their calls read "Using Dashera".
         for (const t of found) {
           const p = /dashera/i.test(t.description + t.name) ? mcpPrefix(t.name) : null
@@ -1257,6 +1456,7 @@ export const register: Register = on => {
         if (answer.ended) {
           endedPause = true
           sessionCode = null
+          codeConnected = false
           say(ENDED_STATUS)
           return
         }
@@ -1283,6 +1483,10 @@ export const register: Register = on => {
         standingDown = false
         // Older Dashera (one live session) may still say standingBy.
         sessionCode = safeSessionCode(answer.session?.code)
+        // Writes get the code only through the connector that gave it, and
+        // only while this conversation is connected and live (0.3.9).
+        codePrefix = lastGood ? mcpPrefix(lastGood) : null
+        codeConnected = !!sessionCode && answer.connected !== false && !answer.standingBy
         // Continuity: connected under this id now. Remember it (here and in
         // the plugin's store, per conversation id) so a later id can name it.
         if (answer.connected !== false && sessionCode && where.sessionId) {
