@@ -101,6 +101,14 @@ A `dashera` folder under the session's mods folder and `dashera` in `claude plug
 
 **Why a list.** A hooks module sees a tool's name and description (`$.tool.list()`), never an MCP tool's input schema, so the plugin can't ask whether a tool takes `session`. The list is taken from the Dashera source: every tool whose input schema has a `session` property (the tools written with `session: SESSION_PROP`, and the `AUTO_SESSION_TOOLS` that get it added, in lib/agent-cli/src/tools.ts), less the read tools and less the writes where `session` names someone else. `build_report_limit` is filled: left out, its `session` pauses all of the agent's runs, not only this conversation's. The Chief of Staff tools are filled too: their `session` is the session acting for the Owner (`build_set_qa_seat` names its seat with `target`). It must be kept in step with Dashera: a new write tool that takes `session` gets no fill until it is added here, and a renamed or dropped one is simply never called.
 
+**Keeping the list in step.** `tests/dashera-session-tools.snapshot.ts` is a checked-in snapshot of every Dashera tool whose schema has `session`, with its access and the field's description. `tests/sessiontools.test.ts` fails, naming the tools, when a Dashera write tool in the snapshot is on neither `SESSION_WRITE_TOOLS` nor `NEVER_FILL`, when the list names a tool the snapshot doesn't have as a write, or when a read tool is on it. Regenerate the snapshot whenever Dashera adds, renames or drops a tool that takes `session` (every Dashera release that touches tools.ts), then run the tests and add each new tool to one of the two lists:
+
+```
+cd <dashera>/lib/agent-cli
+./node_modules/.bin/tsx <plugin>/scripts/sync-session-tools.ts "$PWD/src/tools.ts" <plugin>/tests/dashera-session-tools.snapshot.ts
+claude plugin test <plugin>
+```
+
 **Never touched.**
 - Read tools, including the reads that take `session` as a filter (`list_agent_inbox`, `upcoming_reminders`, `list_unanswered`, `live_session`, `build_read_added_item`): filling would change what they answer.
 - Writes whose `session` is another session: `wake_teammate` (the teammate to wake), `build_add_agent` and `build_remove_agent` (the session to seat or remove).
