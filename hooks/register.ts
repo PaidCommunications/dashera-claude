@@ -268,6 +268,66 @@ export function lastCustomTitle(tail: string): string | null {
   return null
 }
 
+// ---- Context size (0.3.10, Dashera Token savings 2) ----
+/** How much of the transcript's end is read for the last turn's usage. */
+export const CONTEXT_TAIL_BYTES = 256 * 1024
+/** The usage is read again at most this often (with the title's cadence). */
+export const CONTEXT_REFRESH_MS = 60_000
+/** A size is sent again when it moved by more than this share... */
+export const CONTEXT_RESEND_SHARE = 0.05
+/** ...or this long after it was last sent. */
+export const CONTEXT_RESEND_MS = 10 * 60_000
+
+/**
+ * The conversation's context size in tokens, from the end of its
+ * transcript: the usage numbers on the last main-thread (not isSidechain)
+ * assistant line. input_tokens + cache_creation_input_tokens +
+ * cache_read_input_tokens is what the next turn reloads. Numbers only: the
+ * line's content is never kept or sent. Null when the tail holds none.
+ */
+export function lastContextTokens(tail: string): number | null {
+  const lines = tail.split('\n')
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i]!
+    if (!line.includes('"usage"') || !line.includes('"assistant"')) continue
+    try {
+      const row = JSON.parse(line) as {
+        type?: unknown
+        isSidechain?: unknown
+        message?: { usage?: Record<string, unknown> }
+      }
+      if (row.type !== 'assistant' || row.isSidechain === true) continue
+      const u = row.message?.usage
+      if (!u || typeof u !== 'object') continue
+      const n = (k: string) => {
+        const v = u[k]
+        return typeof v === 'number' && Number.isFinite(v) && v >= 0 ? Math.floor(v) : 0
+      }
+      const total = n('input_tokens') + n('cache_creation_input_tokens') + n('cache_read_input_tokens')
+      return total > 0 ? Math.min(total, 10_000_000) : null
+    } catch {
+      // A line the tail cut, or not JSON: look further up.
+    }
+  }
+  return null
+}
+
+/** The size to send with this check: a new one, a big move, or a stale send. */
+export function contextToSend(
+  current: number | null,
+  lastSent: number | null,
+  lastSentAt: number,
+  now: number,
+): number | null {
+  if (current === null) return null
+  if (lastSent === null) return current
+  if (Math.abs(current - lastSent) > lastSent * CONTEXT_RESEND_SHARE) return current
+  return now - lastSentAt >= CONTEXT_RESEND_MS ? current : null
+}
+
+/** Whether this Dashera takes contextTokens (0.3.10; its tool list says so). */
+export const takesContext = (t: { description: string }) => /contextTokens/.test(t.description)
+
 /** The title to send with this check: only one that differs from the last sent. */
 export function titleToSend(current: string | null, lastSent: string | null): string | null {
   return current && current !== lastSent ? current : null
@@ -776,6 +836,12 @@ export const register: Register = on => {
   let title: string | null = null
   let lastSentTitle: string | null = null
   let pendingTitle: string | null = null
+  // Context size (0.3.10): the last turn's, as the transcript said, and the
+  // size last sent to Dashera and when.
+  let contextTokens: number | null = null
+  let lastSentContext: number | null = null
+  let lastSentContextAt = 0
+  let contextReadAt = Number.NEGATIVE_INFINITY
   // Ended (0.2.15): no checks until a prompt arrives in this conversation.
   let endedPause = false
   // Continuity (0.3.0): the id this conversation last checked in under while
@@ -1099,6 +1165,18 @@ export const register: Register = on => {
       const found = lastCustomTitle(text)
       if (found) title = found
     }
+    // Context size (0.3.10): the end of the same file, numbers only.
+    const readContext = async () => {
+      transcript ??= await findTranscript()
+      if (!transcript) return
+      const tail = await within(
+        $.process.run(['tail', '-c', String(CONTEXT_TAIL_BYTES), transcript], { timeoutMs: 3000 }),
+        4000,
+      )
+      if (!tail || tail.exitCode !== 0) return
+      const found = lastContextTokens(tail.stdout)
+      if (found !== null) contextTokens = found
+    }
     // The status line (0.3.8: with the latest prompt's submit result for
     // SUBMIT_SHOWN_MS, so a copy whose prompts go nowhere shows it).
     let shown: string | null = null
@@ -1278,6 +1356,9 @@ export const register: Register = on => {
           where.sessionId = idNow
           transcript = null
           titleReadAt = Number.NEGATIVE_INFINITY
+          contextReadAt = Number.NEGATIVE_INFINITY
+          contextTokens = null
+          lastSentContext = null
           lastSentTitle = null
           sessionCode = null
           codePrefix = null
@@ -1311,6 +1392,11 @@ export const register: Register = on => {
         }
         const tools = await $.tool.list()
         const found = wakeTools(tools, lastGood)
+        // Context size (0.3.10): read only for a Dashera that takes it.
+        if (found.some(takesContext) && at - contextReadAt >= CONTEXT_REFRESH_MS) {
+          contextReadAt = at
+          await readContext()
+        }
         // The Dashera connectors (0.3.9): a wake_status beside check_in or
         // advance_cursor under one prefix.
         connectors = dasheraConnectors(tools.map(t => t.name))
@@ -1333,7 +1419,7 @@ export const register: Register = on => {
         // covers the tool (found by the HG agent, 2 Nov). With two Dashera
         // connectors only one may be allowed, so try each, the last one that
         // answered first.
-        const ask = async (name: string, extra: Record<string, string | boolean>): Promise<Reply> => {
+        const ask = async (name: string, extra: Record<string, string | boolean | number>): Promise<Reply> => {
           const server = name.replace(/^mcp__/, '').replace(/__wake_status$/, '')
           try {
             const r = await $.mcp.call(server, 'wake_status', extra)
@@ -1362,7 +1448,7 @@ export const register: Register = on => {
         // session showed as not live (HG, 2 Nov 2026). Give up after 12 s,
         // inside one 15-second tick; the next tick asks again.
         const TIMED_OUT: Reply = { text: 'timed out', failed: true }
-        const askWithin = async (name: string, extra: Record<string, string | boolean>) =>
+        const askWithin = async (name: string, extra: Record<string, string | boolean | number>) =>
           (await within(ask(name, extra), 12_000)) ?? TIMED_OUT
         let answer: Answer | null = null
         let refused: Reply | undefined
@@ -1377,6 +1463,9 @@ export const register: Register = on => {
         const deliveredValue = standingDown ? null : deliveredPending
         const resultValue = standingDown ? null : deliveryPending
         // Activity (0.3.7): only beside a running turn's start, never "none".
+        const contextValue = standingDown
+          ? null
+          : contextToSend(contextTokens, lastSentContext, lastSentContextAt, at)
         const activityValue =
           turnValue && turnValue !== 'none' && activity && activity.at >= runningSince ? activity : null
         let reported: { turn: string | null; delivered: string | null; result: DeliveryResult | null } | null = null
@@ -1391,13 +1480,14 @@ export const register: Register = on => {
           const act = turn && activityValue && takesActivity(t) ? activityValue : null
           const result = sendWhere && resultValue && takesDeliveryResult(t) ? resultValue : null
           const isBroken = sendWhere && broken && takesDeliveryBroken(t)
-          const base: Record<string, string | boolean> = {
+          const base: Record<string, string | boolean | number> = {
             ...withInstance,
             ...(turn ? { turnStartedAt: turn } : {}),
             ...(act ? { activity: act.label, activityAt: new Date(act.at).toISOString() } : {}),
             ...(delivered ? { deliveredMarker: delivered } : {}),
             ...(result ? { deliveryResult: result } : {}),
             ...(isBroken ? { deliveryBroken: true } : {}),
+            ...(sendWhere && contextValue !== null && takesContext(t) ? { contextTokens: contextValue } : {}),
           }
           let reply = await askWithin(t.name, prev ? { ...base, previousSessionId: prev } : base)
           if (reply === TIMED_OUT) return
@@ -1432,6 +1522,11 @@ export const register: Register = on => {
           if (reported.turn) turnSent = reported.turn
           if (reported.delivered && deliveredPending === reported.delivered) deliveredPending = null
           if (reported.result && deliveryPending === reported.result) deliveryPending = null
+        }
+        // Dashera got the context size: sent again only when it moves.
+        if (answer && reported && contextValue !== null && found.some(t => t.name === lastGood && takesContext(t))) {
+          lastSentContext = contextValue
+          lastSentContextAt = at
         }
         if (!answer) {
           // Say why, and what to allow, instead of going quiet.
