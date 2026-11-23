@@ -254,6 +254,26 @@ test('a forced save failure does not compact', async ($, on) => {
   expect(r.statuses.some(s => s.includes('checkpoint not confirmed, not compacting'))).toBe(true)
 })
 
+test('a failed /dashera-compact save disarms the command: a wake-started turn minutes later cannot compact', async ($, on) => {
+  const r = await live($, on)
+  await $.command.run({ command: 'dashera-compact', args: '', origin: owner } as never)
+  await r.clock.advance(1_000)
+  r.reply({ text: '{"error":"stale_version","code":"stale_version"}', isError: true })
+  await $.turn.start({ text: COMPACT_REQUEST_PROMPT, turnId: 'd1' })
+  await $.tool.call({ tool: `${D}checkpoint_work`, compactAfter: true, operationKey: 'op-d1', expectedVersion: 2 } as never)
+  await $.turn.complete(done('d1'))
+  await r.clock.advance(60_000)
+  // Two minutes later, a wake-up's turn saves with compactAfter.
+  r.reply({ text: confirmed() })
+  await $.prompt.submit({ text: 'New activity in Dashera.', origin: { kind: 'plugin', name: 'dashera' } } as never)
+  await $.turn.start({ text: 'New activity in Dashera.', turnId: 'd2' })
+  await $.tool.call({ tool: `${D}checkpoint_work`, compactAfter: true, operationKey: 'op-d2', expectedVersion: 2 } as never)
+  await $.turn.complete(done('d2'))
+  await r.clock.advance(5_000)
+  expect(r.compacts).toEqual([])
+  expect(resumes(r.calls).at(-1)).toMatchObject({ compaction: { id: COMP, status: 'vetoed' } })
+})
+
 test('a wake-started turn cannot trigger compaction, even saying yes', async ($, on) => {
   const r = await live($, on)
   // A wake-up's prompt (the plugin's own) or another agent's message.

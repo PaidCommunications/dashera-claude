@@ -1331,7 +1331,9 @@ export const register: Register = on => {
         if (s.tool !== 'checkpoint_work' || args.compactAfter !== true) return r
         const confirmed = failed ? null : parseCheckpointAnswer(text)
         if (!confirmed || !confirmed.checkpointId || !confirmed.compactionId || confirmed.compactionStatus !== 'pending') {
-          // No confirmation, no compaction.
+          // No confirmation, no compaction, and /dashera-compact's arming
+          // ends with it: a later turn (a wake-up's) can't use it.
+          commandArmedAt = Number.NEGATIVE_INFINITY
           if (!confirmed || confirmed.compactionStatus !== 'not_supported') {
             contextNote = 'Dashera: checkpoint not confirmed, not compacting'
             sayAgain?.()
