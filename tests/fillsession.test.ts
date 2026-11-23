@@ -103,12 +103,23 @@ test('a read tool is unchanged', async ($, on) => {
 
 test('writes whose session names another session are unchanged', async ($, on) => {
   const { seen } = await liveAs($, on, {
-    tools: [`${D}wake_status`, `${D}check_in`, `${D}wake_teammate`, `${D}build_add_agent`, `${D}build_report_limit`],
+    tools: [`${D}wake_status`, `${D}check_in`, `${D}wake_teammate`, `${D}build_add_agent`, `${D}build_remove_agent`],
   })
   await call($, `${D}wake_teammate`, { note: 'n' })
   await call($, `${D}build_add_agent`, { build: 'b' })
-  await call($, `${D}build_report_limit`, { build: 'b' })
+  await call($, `${D}build_remove_agent`, { build: 'b' })
   expect(seen.map(s => 'session' in s.args)).toEqual([false, false, false])
+})
+
+test('build_report_limit gets this conversation’s code, so only its own runs pause', async ($, on) => {
+  const { seen } = await liveAs($, on, {
+    tools: [`${D}wake_status`, `${D}check_in`, `${D}build_report_limit`, `${D}build_set_qa_seat`],
+  })
+  await call($, `${D}build_report_limit`, { build: 'b' })
+  // A Chief of Staff tool: session is the actor, the seat is `target`.
+  await call($, `${D}build_set_qa_seat`, { build: 'b', target: 'S-222222' })
+  expect(seen.map(s => s.args.session)).toEqual([CODE, CODE])
+  expect(seen[1]!.args.target).toBe('S-222222')
 })
 
 test('a tool of another MCP server is unchanged, even with a Dashera name', async ($, on) => {

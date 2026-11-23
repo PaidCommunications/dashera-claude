@@ -99,11 +99,11 @@ A `dashera` folder under the session's mods folder and `dashera` in `claude plug
 
 `check_in`, `advance_cursor` and `name_my_session` keep the behaviour they have had since 2 Nov 2026 (filled on any connector, connected or not, since naming the session is how it connects).
 
-**Why a list.** A hooks module sees a tool's name and description (`$.tool.list()`), never an MCP tool's input schema, so the plugin can't ask whether a tool takes `session`. The list is taken from the Dashera source: every tool whose input schema has a `session` property (the tools written with `session: SESSION_PROP`, and the `AUTO_SESSION_TOOLS` that get it added, in lib/agent-cli/src/tools.ts), less the read tools and less the writes where `session` names someone else. It must be kept in step with Dashera: a new write tool that takes `session` gets no fill until it is added here, and a renamed or dropped one is simply never called.
+**Why a list.** A hooks module sees a tool's name and description (`$.tool.list()`), never an MCP tool's input schema, so the plugin can't ask whether a tool takes `session`. The list is taken from the Dashera source: every tool whose input schema has a `session` property (the tools written with `session: SESSION_PROP`, and the `AUTO_SESSION_TOOLS` that get it added, in lib/agent-cli/src/tools.ts), less the read tools and less the writes where `session` names someone else. `build_report_limit` is filled: left out, its `session` pauses all of the agent's runs, not only this conversation's. The Chief of Staff tools are filled too: their `session` is the session acting for the Owner (`build_set_qa_seat` names its seat with `target`). It must be kept in step with Dashera: a new write tool that takes `session` gets no fill until it is added here, and a renamed or dropped one is simply never called.
 
 **Never touched.**
 - Read tools, including the reads that take `session` as a filter (`list_agent_inbox`, `upcoming_reminders`, `list_unanswered`, `live_session`, `build_read_added_item`): filling would change what they answer.
-- Writes whose `session` is another session or changes the scope: `wake_teammate` (the teammate to wake), `build_add_agent` and `build_remove_agent` (the session to seat or remove), `build_report_limit` (given, only that session's runs pause).
+- Writes whose `session` is another session: `wake_teammate` (the teammate to wake), `build_add_agent` and `build_remove_agent` (the session to seat or remove).
 - `call`, `load_tools`, `wake_status` and every tool of any other server.
 - Every other argument: the hook adds one field and reads nothing else of the call.
 

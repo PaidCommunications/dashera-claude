@@ -444,7 +444,8 @@ export const takesSession = (name: string) =>
  * Taken from Dashera's lib/agent-cli/src/tools.ts (every tool whose input
  * schema has `session`: `session: SESSION_PROP` and AUTO_SESSION_TOOLS),
  * less the reads and less the writes where `session` names another session
- * or narrows the scope (NEVER_FILL). A hooks module never sees an MCP tool's
+ * (NEVER_FILL). build_report_limit is on it: left out, its session pauses
+ * all of the agent's runs, not only this conversation's. A hooks module never sees an MCP tool's
  * input schema, so this list must be kept in step with Dashera's tools.
  */
 export const SESSION_WRITE_TOOLS: ReadonlySet<string> = new Set([
@@ -455,6 +456,7 @@ export const SESSION_WRITE_TOOLS: ReadonlySet<string> = new Set([
   'build_hand_off', 'build_import_items', 'build_join_room', 'build_pause_scheduled_run',
   'build_post_checklist', 'build_propose_scheduled_run', 'build_record_checklist_reply',
   'build_record_decision', 'build_rename_room', 'build_report_access', 'build_report_env_names',
+  'build_report_limit',
   'build_report_push', 'build_report_review', 'build_report_scheduled_run',
   'build_request_plan_changes', 'build_request_sessions', 'build_schedule_run',
   'build_scheduled_run_action', 'build_scheduled_run_settings', 'build_set_brief',
@@ -490,9 +492,9 @@ export const SESSION_WRITE_TOOLS: ReadonlySet<string> = new Set([
   'upsert_deals', 'upsert_price_agreements', 'upsert_price_tiers', 'upsert_promotions',
   'upsert_spifs', 'upsert_teams'
 ])
-/** Dashera tools whose `session` is never filled (another session, a scope, a filter). */
+/** Dashera tools whose `session` is never filled (another session, or a read's filter). */
 export const NEVER_FILL: ReadonlySet<string> = new Set([
-  'wake_teammate', 'build_add_agent', 'build_remove_agent', 'build_report_limit',
+  'wake_teammate', 'build_add_agent', 'build_remove_agent',
   'list_agent_inbox', 'upcoming_reminders', 'list_unanswered', 'live_session',
   'build_read_added_item', 'call', 'load_tools', 'wake_status',
 ])
