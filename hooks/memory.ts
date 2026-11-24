@@ -82,7 +82,7 @@ export function noticeDue(tokens: number | null, window: number | null, baseline
 /** The status line's notice. */
 export function noticeText(tokens: number, percent: number | null): string {
   const k = Math.round(tokens / 1000)
-  return `Context ${k}K${percent !== null ? ` (${percent}%)` : ''}. /dashera-compact saves to Dashera and compresses.`
+  return `Context ${k}K${percent !== null ? ` (${percent}%)` : ''}. Say "compact this session" to back up to Dashera and compress.`
 }
 
 /** A prompt's origin the plugin counts as the owner's own typed message. */
@@ -108,6 +108,9 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
  */
 export function parseCheckpointAnswer(text: string | undefined): CheckpointConfirm | null {
   if (!text) return null
+  // The answer inside Dashera's data fence when there is one.
+  const fenced = /<dashera_data>\s*([\s\S]*?)\s*<\/dashera_data>/.exec(text)
+  if (fenced) text = fenced[1]!
   const start = text.indexOf('{')
   const end = text.lastIndexOf('}')
   if (start < 0 || end <= start) return null
@@ -191,3 +194,24 @@ export function reportText(r: CompactionReport | null): string {
   return lines.join('\n')
 }
 
+
+/**
+ * Whether an owner's typed message asks to compact this session, in any
+ * wording (Julian, 24 Nov 2026): "compact this session, make sure your
+ * context is all fully backed up to Dashera", a bare "compact this
+ * session", "compress your context", "clear up your context". Not a
+ * question about compaction, not a quoted phrase, not a description of how
+ * people will use it. Only a hint for the status line: the session decides,
+ * and asks once when it's unclear; only the owner's own turn can compact.
+ */
+export function isCompactRequest(text: string): boolean {
+  const t = text.trim()
+  if (!t) return false
+  // A question, or the phrase quoted or described, is not a request.
+  if (/\?\s*$/.test(t)) return false
+  if (/["“”'‘’`][^"“”'‘’`]*\b(compact|compress)\b[^"“”'‘’`]*["“”'‘’`]/i.test(t)) return false
+  if (/\b(how|what|when|why|whether|if)\b[^.]*\b(compact|compress)/i.test(t)) return false
+  if (/\b(people|users|owners|they|someone|anyone)\b[^.]*\b(will|would|can|could|might)\b[^.]*\b(say|type|ask|use)\b/i.test(t)) return false
+  return /\b(compact|compress|clear up|clean up)\b[^.]*\b(this session|the session|your context|this context|context|session|yourself)\b/i.test(t) ||
+    /^(please\s+)?(compact|compress)( now| it| yourself)?[.!]*$/i.test(t)
+}

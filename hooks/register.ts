@@ -10,6 +10,7 @@ import {
   type CompactionReport,
   categorySplit,
   compactInstructions,
+  isCompactRequest,
   isOwnerOrigin,
   noticeDue,
   noticeText,
@@ -844,7 +845,14 @@ export const register: Register = on => {
   let contextNote: string | null = null
   let sayAgain: (() => void) | null = null
   let afterCompaction:
-    | ((c: { source: string; compactionId?: string; tokensBefore?: number; tokensAfter?: number }) => Promise<void>)
+    | ((c: {
+        source: string
+        compactionId?: string
+        tokensBefore?: number
+        tokensAfter?: number
+        prefix?: string
+        code?: string
+      }) => Promise<void>)
     | null = null
   // Filling session on writes (0.3.9): the prefix of the connector whose
   // check gave the code, whether that check said connected, the Dashera
@@ -1097,7 +1105,17 @@ export const register: Register = on => {
   let nextTurnOwner = false
   let commandArmedAt = Number.NEGATIVE_INFINITY
   const COMMAND_ARM_MS = 10 * 60_000
-  let pendingCompaction: { id: string; checkpointId: string; version: number; tries: number } | null = null
+  // The connector (prefix) and session code the save went through: a
+  // session can have two Dashera connectors, and the one the poll uses may
+  // not be the one the model saved through (Release 2e live test, 24 Nov).
+  let pendingCompaction: {
+    id: string
+    checkpointId: string
+    version: number
+    tries: number
+    prefix: string
+    code: string
+  } | null = null
   let compacting = false
   const handledCompactions = new Set<string>()
   let epoch: number | null = null
@@ -1119,6 +1137,12 @@ export const register: Register = on => {
   // else delivered into a running turn takes that away.
   on('prompt.submit', async ($, e, next) => {
     const owner = isOwnerOrigin((e as { origin?: unknown }).origin)
+    // The owner asked in plain words: say on the status line that the
+    // session saves to Dashera first. The session itself decides.
+    if (owner && isCompactRequest(e.text) && sessionCode) {
+      contextNote = 'Dashera: backing up to Dashera before compacting'
+      sayAgain?.()
+    }
     if ((e as { turnId?: string }).turnId !== undefined) ownerTurn = ownerTurn && owner ? true : owner
     else nextTurnOwner = owner
     return next(e)
@@ -1171,11 +1195,12 @@ export const register: Register = on => {
     }
     const later = <T,>(p: Promise<T>, ms: number): Promise<T | 'timeout'> =>
       Promise.race([p, new Promise<'timeout'>(r => void $.clock.after(ms, () => r('timeout')))])
-    // A call to this conversation's own Dashera connector (the one whose
-    // check gave the code). Null when there is none or it failed.
-    const callDashera = async (tool: string, args: Record<string, unknown>): Promise<string | null> => {
-      const prefix = codePrefix
-      if (!prefix || !sessionCode) return null
+    // A call to one of this conversation's Dashera connectors: the one a
+    // save went through, else the one whose check gave the code. Null when
+    // there is none or it failed.
+    const callDashera = async (tool: string, args: Record<string, unknown>, via?: string): Promise<string | null> => {
+      const prefix = via ?? codePrefix
+      if (!prefix) return null
       const server = prefix.replace(/^mcp__/, '').replace(/__$/, '')
       try {
         const r = await $.mcp.call(server, tool, args)
@@ -1200,12 +1225,28 @@ export const register: Register = on => {
         return null
       }
     }
-    const reportCompaction = async (id: string, status: string, extra: Record<string, unknown> = {}) => {
-      if (!sessionCode) return
+    const reportCompaction = async (
+      id: string,
+      status: string,
+      extra: Record<string, unknown> = {},
+      via: { prefix?: string; code?: string | null } = {},
+    ) => {
+      const code = via.code ?? sessionCode
+      if (!code) return
       for (let i = 0; i < 3; i++) {
-        const r = await later(callDashera('resume_work', { session: sessionCode, compaction: { id, status, ...extra } }), 15_000)
+        const r = await later(
+          callDashera('resume_work', { session: code, compaction: { id, status, ...extra } }, via.prefix),
+          15_000,
+        )
         if (r !== 'timeout' && r !== null) return
       }
+    }
+    // Said plainly when a compaction can't go ahead (0.3.10 review): on the
+    // status line, and to Dashera as failed or vetoed, so nothing sits at
+    // pending.
+    const cannotCompact = (note: string) => {
+      contextNote = `Dashera: ${note}`
+      sayAgain?.()
     }
 
     afterCompaction = async c => {
@@ -1214,7 +1255,7 @@ export const register: Register = on => {
       // compaction: the epoch advances once.
       if (now - lastAdvanceAt < EPOCH_DEDUPE_MS) return
       lastAdvanceAt = now
-      const code = sessionCode
+      const code = c.code ?? sessionCode
       const after = await usageOf(true)
       const tokensAfter = c.tokensAfter ?? after?.context.tokens
       report = {
@@ -1238,7 +1279,9 @@ export const register: Register = on => {
       let answer: string | null = null
       for (let i = 0; i < 3 && answer === null; i++) {
         const r = await later(
-          callDashera('resume_work', {
+          callDashera(
+            'resume_work',
+            {
             session: code,
             newContext: true,
             contextOperation: op,
@@ -1253,7 +1296,9 @@ export const register: Register = on => {
                   },
                 }
               : {}),
-          }),
+            },
+            c.prefix,
+          ),
           15_000,
         )
         answer = r === 'timeout' ? null : r
@@ -1267,37 +1312,51 @@ export const register: Register = on => {
 
     compactNow = async () => {
       const p = pendingCompaction
-      if (!p || compacting || !sessionCode) return
+      if (!p || compacting) return
       compacting = true
+      const via = { prefix: p.prefix, code: p.code }
       try {
         const before = await usageOf()
         let r: Awaited<ReturnType<typeof $.session.compact>> | 'timeout'
         try {
-          r = await later($.session.compact({ instructions: compactInstructions(sessionCode, p.checkpointId, p.version) }), COMPACT_TIMEOUT_MS)
+          r = await later($.session.compact({ instructions: compactInstructions(p.code, p.checkpointId, p.version) }), COMPACT_TIMEOUT_MS)
         } catch (err) {
-          // Rejected (a turn running, or no compaction here): never forced.
+          // An engine without plugin compaction: said at once, never pending.
+          if (err instanceof TypeError) {
+            pendingCompaction = null
+            handledCompactions.add(p.id)
+            cannotCompact('this app cannot compact from a plugin; checkpoint saved, run /compact yourself')
+            await reportCompaction(p.id, 'failed', { detail: 'compact_unavailable' }, via)
+            return
+          }
+          // Rejected (a turn running): never forced, tried at the next turn ends.
           p.tries += 1
           if (p.tries >= COMPACT_TRIES) {
             pendingCompaction = null
             handledCompactions.add(p.id)
-            await reportCompaction(p.id, 'failed', { detail: String(err instanceof Error ? err.message : err).slice(0, 160) })
+            cannotCompact('compaction was refused; checkpoint saved')
+            await reportCompaction(p.id, 'failed', { detail: String(err instanceof Error ? err.message : err).slice(0, 160) }, via)
           }
           return
         }
         pendingCompaction = null
         handledCompactions.add(p.id)
         if (r === 'timeout') {
-          await reportCompaction(p.id, 'unknown', { detail: 'no answer within 10 minutes' })
+          cannotCompact('compaction did not answer; checkpoint saved')
+          await reportCompaction(p.id, 'unknown', { detail: 'no answer within 10 minutes' }, via)
           return
         }
         if ('skip' in r && typeof r.skip === 'string') {
-          await reportCompaction(p.id, 'vetoed', { detail: r.skip.slice(0, 160) })
+          cannotCompact('compaction was vetoed; checkpoint saved')
+          await reportCompaction(p.id, 'vetoed', { detail: r.skip.slice(0, 160) }, via)
           return
         }
         const done = r as { tokensBefore?: number; tokensAfter?: number }
         await afterCompaction?.({
           source: 'dashera-compact',
           compactionId: p.id,
+          prefix: p.prefix,
+          code: p.code,
           tokensBefore: done.tokensBefore ?? before?.context.tokens,
           tokensAfter: done.tokensAfter,
         })
@@ -1315,7 +1374,10 @@ export const register: Register = on => {
       try {
         const s = splitMcpName(e.tool)
         const origin = (callNext as { origin?: { plugin?: string } }).origin
-        if (!s || !codePrefix || s.prefix !== codePrefix || origin?.plugin === $.plugin.name) return r
+        // Any of this conversation's Dashera connectors (0.3.10 review): the
+        // one the poll uses, or another that lists Dashera's check tools.
+        const isDashera = !!s && (s.prefix === codePrefix || connectors.has(s.prefix) || dasheraPrefixes.has(s.prefix))
+        if (!s || !isDashera || origin?.plugin === $.plugin.name) return r
         const text = (r as { text?: string }).text
         const failed = (r as { isError?: boolean; deny?: string }).isError === true || (r as { deny?: string }).deny !== undefined
         // Dashera's own answers in the new context, by size only.
@@ -1330,6 +1392,8 @@ export const register: Register = on => {
         const args = e as unknown as Record<string, unknown>
         if (s.tool !== 'checkpoint_work' || args.compactAfter !== true) return r
         const confirmed = failed ? null : parseCheckpointAnswer(text)
+        const savedAs = safeSessionCode(args.session) ?? (s.prefix === codePrefix ? sessionCode : null)
+        const via = { prefix: s.prefix, code: savedAs }
         if (!confirmed || !confirmed.checkpointId || !confirmed.compactionId || confirmed.compactionStatus !== 'pending') {
           // No confirmation, no compaction, and /dashera-compact's arming
           // ends with it: a later turn (a wake-up's) can't use it.
@@ -1346,15 +1410,37 @@ export const register: Register = on => {
         const byOwner = e.agentId === undefined && (ownerTurn || now - commandArmedAt < COMMAND_ARM_MS)
         if (!byOwner) {
           handledCompactions.add(confirmed.compactionId)
-          void reportCompaction(confirmed.compactionId, 'vetoed', {
-            detail: e.agentId !== undefined ? 'not_owner: a subagent asked' : 'not_owner: the turn was not started by the owner',
-          })
+          void reportCompaction(
+            confirmed.compactionId,
+            'vetoed',
+            { detail: e.agentId !== undefined ? 'not_owner: a subagent asked' : 'not_owner: the turn was not started by the owner' },
+            via,
+          )
           return r
         }
-        // The repeat's no-op answer names the pending one; its version comes
-        // from the save that made it, so only a fresh confirmation arms it.
-        if (confirmed.version === null) return r
-        pendingCompaction = { id: confirmed.compactionId, checkpointId: confirmed.checkpointId, version: confirmed.version, tries: 0 }
+        // The repeat's no-op answer names a pending one this copy never
+        // armed (an earlier copy, or a save that never reached here): it can't
+        // run, so it is reported failed, never left pending, and said plainly.
+        if (confirmed.version === null) {
+          handledCompactions.add(confirmed.compactionId)
+          cannotCompact('an earlier compaction never ran; it is cleared, ask again')
+          void reportCompaction(confirmed.compactionId, 'failed', { detail: 'never_armed' }, via)
+          return r
+        }
+        if (!savedAs) {
+          handledCompactions.add(confirmed.compactionId)
+          cannotCompact('could not tell which session saved; not compacting')
+          void reportCompaction(confirmed.compactionId, 'failed', { detail: 'no_session_code' }, via)
+          return r
+        }
+        pendingCompaction = {
+          id: confirmed.compactionId,
+          checkpointId: confirmed.checkpointId,
+          version: confirmed.version,
+          tries: 0,
+          prefix: s.prefix,
+          code: savedAs,
+        }
         commandArmedAt = Number.NEGATIVE_INFINITY
       } catch {
         // Never in the way of the call's own result.

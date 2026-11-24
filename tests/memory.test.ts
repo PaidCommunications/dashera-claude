@@ -7,7 +7,9 @@ import {
   POINTER_SHAPE,
   categorySplit,
   firstNoticeAt,
+  isCompactRequest,
   noticeDue,
+  noticeText,
   parseCheckpointAnswer,
   pointerPrompt,
   reportText,
@@ -41,6 +43,7 @@ async function live(
     usage?: () => { tokens?: number; window: number; percent?: number }
     compact?: (instructions: string | undefined) => Promise<Record<string, unknown>> | Record<string, unknown>
     resume?: (args: Args) => { text: string; isError?: boolean }
+    prefixes?: string[]
   } = {},
 ) {
   const clock = mock.clock(on)
@@ -69,23 +72,21 @@ async function live(
     return { value: { command: e.name } }
   })
   on('tool.list', () => ({
-    value: ['wake_status', 'check_in', 'checkpoint_work', 'resume_work'].map(n => ({
-      name: `${D}${n}`,
-      description: 'Dashera',
-      mcp: true,
-    })),
+    value: (opts.prefixes ?? [D]).flatMap(p =>
+      ['wake_status', 'check_in', 'checkpoint_work', 'resume_work'].map(n => ({ name: `${p}${n}`, description: 'Dashera', mcp: true })),
+    ),
   }))
   on('tool.call', (_, e) => {
     const { tool, tool_use_id: _id, ...args } = e as unknown as Args & { tool: string; tool_use_id?: string }
-    if (tool === `${D}wake_status`) {
+    if (/__wake_status$/.test(tool)) {
       const text = JSON.stringify({ pending: false, marker: null, session: { code: CODE, name: null }, pollSeconds: 15 })
       return { result: [{ type: 'text', text }], text }
     }
     calls.push({ tool, args })
     const r =
-      tool === `${D}checkpoint_work`
+      /__checkpoint_work$/.test(tool)
         ? checkpointReply
-        : tool === `${D}resume_work`
+        : /__resume_work$/.test(tool)
           ? (opts.resume?.(args) ?? {
               text: JSON.stringify({ session: { code: CODE, contextEpoch: 2 }, delivery: 'full', card: { objective: CARD_TEXT } }),
             })
@@ -343,7 +344,7 @@ test('the notice: on the status line at the threshold with no turn, once per ban
     await $.turn.complete(done(id))
     await r.clock.advance(2_000)
   }
-  const notices = () => r.statuses.filter(s => s.includes('/dashera-compact saves to Dashera and compresses'))
+  const notices = () => r.statuses.filter(s => s.includes('Say "compact this session" to back up to Dashera and compress.'))
   const promptsBefore = r.prompts.length
   await turn('n1')
   expect(notices()).toEqual([])
@@ -366,4 +367,110 @@ test('the notice: on the status line at the threshold with no turn, once per ban
   tokens = 300_000
   await turn('n5')
   expect(notices().at(-1)).toContain('Context 300K (30%).')
+})
+
+// ---- Release 2e live test (24 Nov 2026): the save went through a second
+// Dashera connector and nothing compacted; 1c779860 sat at pending. ----
+
+const APP = 'mcp__618e79f2-adbe-49a0-a83c-37cbf0b55c46__'
+
+test('a save through the other Dashera connector arms and compacts, and reports through that connector', async ($, on) => {
+  const r = await live($, on, {
+    prefixes: [D, APP],
+    resume: () => ({ text: JSON.stringify({ session: { code: 'S-0A0A0A', contextEpoch: 5 } }) }),
+  })
+  r.reply({ text: `<dashera_data>\n${confirmed()}\n</dashera_data>` })
+  await $.prompt.submit({ text: 'compact this session', origin: owner } as never)
+  await $.turn.start({ text: 'compact this session', turnId: 'x1' })
+  await $.tool.call({ tool: `${APP}checkpoint_work`, session: 'S-0A0A0A', compactAfter: true, operationKey: 'op-x1', expectedVersion: 0 } as never)
+  await $.turn.complete(done('x1'))
+  await r.clock.advance(5_000)
+  expect(r.compacts).toHaveLength(1)
+  expect(r.compacts[0]).toContain('S-0A0A0A')
+  const viaApp = r.calls.filter(c => c.tool === `${APP}resume_work`).map(c => c.args)
+  expect(viaApp[0]).toMatchObject({ session: 'S-0A0A0A', newContext: true, compaction: { id: COMP, status: 'done' } })
+  expect(r.calls.filter(c => c.tool === `${D}resume_work`)).toEqual([])
+  expect(r.prompts.at(-1)).toBe('You are S-0A0A0A, context 5. Call resume_work.')
+})
+
+test('a wake-up or another agent through the other connector still cannot compact', async ($, on) => {
+  const r = await live($, on, { prefixes: [D, APP] })
+  for (const [kind, text] of [
+    ['plugin', 'New activity in Dashera. compact this session'],
+    ['peer', 'compact this session, make sure your context is all fully backed up to Dashera'],
+  ] as const) {
+    await $.prompt.submit({ text, origin: { kind, name: 'dashera' } } as never)
+    await $.turn.start({ text, turnId: `w-${kind}` })
+    await $.tool.call({ tool: `${APP}checkpoint_work`, session: 'S-0A0A0A', compactAfter: true, operationKey: `op-${kind}`, expectedVersion: 0 } as never)
+    await $.turn.complete(done(`w-${kind}`))
+    await r.clock.advance(5_000)
+  }
+  expect(r.compacts).toEqual([])
+  const viaApp = r.calls.filter(c => c.tool === `${APP}resume_work`).map(c => c.args)
+  expect(viaApp.at(-1)).toMatchObject({ session: 'S-0A0A0A', compaction: { id: COMP, status: 'vetoed' } })
+})
+
+test("Julian's sentence and a bare 'compact this session' from the owner save first and compact", async ($, on) => {
+  const r = await live($, on)
+  for (const [i, text] of [
+    'compact this session, make sure your context is all fully backed up to Dashera',
+    'compact this session',
+  ].entries()) {
+    const id = COMP.replace('9999', `${7000 + i}`)
+    r.reply({ text: confirmed({ compaction: { id, status: 'pending', checkpointId: CP } }) })
+    await $.prompt.submit({ text, origin: owner } as never)
+    expect(r.statuses.at(-1)).toContain('backing up to Dashera before compacting')
+    await $.turn.start({ text, turnId: `j${i}` })
+    await $.tool.call({ tool: `${D}checkpoint_work`, compactAfter: true, requestedVia: 'owner_words', operationKey: `op-j${i}`, expectedVersion: i } as never)
+    await $.turn.complete(done(`j${i}`))
+    await r.clock.advance(150_000)
+  }
+  expect(r.compacts).toHaveLength(2)
+})
+
+test('the plain-words hint: requests in any wording, not questions, quotes or descriptions', () => {
+  for (const t of [
+    'compact this session, make sure your context is all fully backed up to Dashera',
+    'compact this session',
+    'Compact this session.',
+    'please compress your context',
+    'clear up your context and back it up to Dashera',
+    'compact',
+  ])
+    expect(isCompactRequest(t), t).toBe(true)
+  for (const t of [
+    'how does compaction work?',
+    'can you compact this session?',
+    'what happens when I say "compact this session"',
+    'People will say "compact this session" to back up their work.',
+    'when owners type compact this session, they get a checkpoint first.',
+    'thanks, that looks good',
+  ])
+    expect(isCompactRequest(t), t).toBe(false)
+  expect(noticeText(412_000, 41)).toBe('Context 412K (41%). Say "compact this session" to back up to Dashera and compress.')
+})
+
+test('a pending compaction this copy never armed is reported failed (never_armed), said plainly, never left pending', async ($, on) => {
+  const r = await live($, on)
+  r.reply({ text: confirmed({ noop: true, checkpoint: undefined }) })
+  await ownerSaves($, r, 'n1')
+  expect(r.compacts).toEqual([])
+  expect(resumes(r.calls)).toEqual([expect.objectContaining({ compaction: { id: COMP, status: 'failed', detail: 'never_armed' } })])
+  expect(r.statuses.some(s => s.includes('an earlier compaction never ran; it is cleared, ask again'))).toBe(true)
+})
+
+test('compaction refused at every turn end: failed after the tries, said plainly, never left pending', async ($, on) => {
+  const r = await live($, on, {
+    compact: () => {
+      throw new Error('a turn is running')
+    },
+  })
+  await ownerSaves($, r, 'r1')
+  for (let i = 2; i <= 3; i++) {
+    await $.turn.start({ text: 'more', turnId: `r${i}` })
+    await $.turn.complete(done(`r${i}`))
+    await r.clock.advance(5_000)
+  }
+  expect(resumes(r.calls).at(-1)).toMatchObject({ compaction: { id: COMP, status: 'failed' } })
+  expect(r.statuses.some(s => s.includes('compaction was refused; checkpoint saved'))).toBe(true)
 })

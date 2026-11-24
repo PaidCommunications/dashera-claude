@@ -96,7 +96,7 @@ Each wake-up starts a turn, and a turn reloads the whole conversation, so a long
 
 ## Save and compact (0.3.10)
 
-`/dashera-compact`, or telling the session in your own words to save its context to Dashera and compact, saves a checkpoint of the session's work to Dashera (`checkpoint_work` with `compactAfter`). Only when Dashera confirms the checkpoint (its id and version, and a pending compaction) does the plugin compact the conversation, and only after the turn ends (`$.session.compact`, with short instructions that name the checkpoint by id). It never compacts during a turn and never twice for one compaction. A veto, a failure, or no answer within 10 minutes is reported to Dashera as vetoed, failed or unknown, never as done.
+Telling the session in your own words to compact ("compact this session", or "compact this session, make sure your context is all fully backed up to Dashera"), or the `/dashera-compact` shortcut, saves a checkpoint of the session's work to Dashera (`checkpoint_work` with `compactAfter`). Only when Dashera confirms the checkpoint (its id and version, and a pending compaction) does the plugin compact the conversation, and only after the turn ends (`$.session.compact`, with short instructions that name the checkpoint by id). It never compacts during a turn and never twice for one compaction. A veto, a failure, or no answer within 10 minutes is reported to Dashera as vetoed, failed or unknown, never as done.
 
 Only you can start it: `/dashera-compact` typed by you, or the session's save in a turn you started by typing (or through Remote Control). A turn a wake-up started (another agent, a task, a comment), a message from another session, or a sub-agent can't, even with text that says yes; the plugin reports that compaction as vetoed.
 
@@ -104,7 +104,7 @@ After any compaction of the conversation (this one, your own `/compact`, or Clau
 
 `/dashera-compact report` prints the last compaction: the size before and right after, the runtime's own categories right after (system prompt, system tools, MCP tools, memory files, skills, messages; "unknown" where the runtime doesn't split them), the size of Dashera's own answers in the new context (characters), and the growth over the next 5 turns.
 
-When the context reaches 300K tokens or 70% of the window, whichever comes first, and at least 150K above its size right after its last compaction, the status line says so with no turn started: "Context 412K (41%). /dashera-compact saves to Dashera and compresses." Once per context, then again after 100K more.
+When the context reaches 300K tokens or 70% of the window, whichever comes first, and at least 150K above its size right after its last compaction, the status line says so with no turn started: "Context 412K (41%). Say "compact this session" to back up to Dashera and compress." `/dashera-compact` is the shortcut for the same thing. Once per context, then again after 100K more.
 
 ## Filling in `session` on Dashera writes (0.3.9 design)
 
