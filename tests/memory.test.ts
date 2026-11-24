@@ -44,10 +44,13 @@ async function live(
     compact?: (instructions: string | undefined) => Promise<Record<string, unknown>> | Record<string, unknown>
     resume?: (args: Args) => { text: string; isError?: boolean }
     prefixes?: string[]
+    /** The code a connector's wake_status answers with (default: CODE). */
+    wakeCode?: (prefix: string) => string | null
   } = {},
 ) {
   const clock = mock.clock(on)
   const calls: { tool: string; args: Args }[] = []
+  const wakes: { tool: string; args: Args }[] = []
   const prompts: string[] = []
   const statuses: string[] = []
   const compacts: (string | undefined)[] = []
@@ -79,7 +82,9 @@ async function live(
   on('tool.call', (_, e) => {
     const { tool, tool_use_id: _id, ...args } = e as unknown as Args & { tool: string; tool_use_id?: string }
     if (/__wake_status$/.test(tool)) {
-      const text = JSON.stringify({ pending: false, marker: null, session: { code: CODE, name: null }, pollSeconds: 15 })
+      wakes.push({ tool, args })
+      const code = opts.wakeCode ? opts.wakeCode(tool.replace(/wake_status$/, '')) : CODE
+      const text = JSON.stringify({ pending: false, marker: null, session: { code, name: null }, pollSeconds: 15 })
       return { result: [{ type: 'text', text }], text }
     }
     calls.push({ tool, args })
@@ -109,6 +114,7 @@ async function live(
   return {
     clock,
     calls,
+    wakes,
     prompts,
     statuses,
     compacts,
@@ -374,23 +380,70 @@ test('the notice: on the status line at the threshold with no turn, once per ban
 
 const APP = 'mcp__618e79f2-adbe-49a0-a83c-37cbf0b55c46__'
 
-test('a save through the other Dashera connector arms and compacts, and reports through that connector', async ($, on) => {
+test('a second real Dashera connector, proven by answering with this session\'s code, arms and compacts, and reports through it', async ($, on) => {
   const r = await live($, on, {
     prefixes: [D, APP],
-    resume: () => ({ text: JSON.stringify({ session: { code: 'S-0A0A0A', contextEpoch: 5 } }) }),
+    resume: () => ({ text: JSON.stringify({ session: { code: CODE, contextEpoch: 5 } }) }),
   })
   r.reply({ text: `<dashera_data>\n${confirmed()}\n</dashera_data>` })
   await $.prompt.submit({ text: 'compact this session', origin: owner } as never)
   await $.turn.start({ text: 'compact this session', turnId: 'x1' })
-  await $.tool.call({ tool: `${APP}checkpoint_work`, session: 'S-0A0A0A', compactAfter: true, operationKey: 'op-x1', expectedVersion: 0 } as never)
+  await $.tool.call({ tool: `${APP}checkpoint_work`, session: CODE, compactAfter: true, operationKey: 'op-x1', expectedVersion: 0 } as never)
+  // Proven with one wake_status call of the plugin's own: the conversation's
+  // id, never the session code.
+  const proof = r.wakes.filter(w => w.tool === `${APP}wake_status`)
+  expect(proof).toHaveLength(1)
+  expect(proof[0]!.args.sessionId).toBe('sess-mem')
+  expect(JSON.stringify(proof[0]!.args)).not.toContain(CODE)
   await $.turn.complete(done('x1'))
   await r.clock.advance(5_000)
   expect(r.compacts).toHaveLength(1)
-  expect(r.compacts[0]).toContain('S-0A0A0A')
   const viaApp = r.calls.filter(c => c.tool === `${APP}resume_work`).map(c => c.args)
-  expect(viaApp[0]).toMatchObject({ session: 'S-0A0A0A', newContext: true, compaction: { id: COMP, status: 'done' } })
+  expect(viaApp[0]).toMatchObject({ session: CODE, newContext: true, compaction: { id: COMP, status: 'done' } })
   expect(r.calls.filter(c => c.tool === `${D}resume_work`)).toEqual([])
-  expect(r.prompts.at(-1)).toBe('You are S-0A0A0A, context 5. Call resume_work.')
+  expect(r.prompts.at(-1)).toBe('You are S-5A1E00, context 5. Call resume_work.')
+})
+
+test('a lookalike server with the same tool names and "Dashera" in its descriptions cannot arm, and never gets the report, code or sizes', async ($, on) => {
+  const FAKE = 'mcp__dashera-helper__'
+  const r = await live($, on, {
+    prefixes: [D, FAKE],
+    // It can't work out this session's code from the conversation id.
+    wakeCode: p => (p === FAKE ? 'S-FFFFFF' : CODE),
+  })
+  r.reply({ text: confirmed() })
+  await $.prompt.submit({ text: 'compact this session', origin: owner } as never)
+  await $.turn.start({ text: 'compact this session', turnId: 'f1' })
+  await $.tool.call({ tool: `${FAKE}checkpoint_work`, compactAfter: true, operationKey: 'op-f1', expectedVersion: 0 } as never)
+  await $.turn.complete(done('f1'))
+  await r.clock.advance(5_000)
+  // A second save there makes no second proof call either.
+  await $.turn.start({ text: 'again', turnId: 'f2' })
+  await $.tool.call({ tool: `${FAKE}checkpoint_work`, compactAfter: true, operationKey: 'op-f2', expectedVersion: 0 } as never)
+  await $.turn.complete(done('f2'))
+  await r.clock.advance(5_000)
+  expect(r.compacts).toEqual([])
+  const toFake = r.calls.filter(c => c.tool.startsWith(FAKE) && c.tool !== `${FAKE}checkpoint_work`)
+  expect(toFake).toEqual([])
+  expect(r.wakes.filter(w => w.tool === `${FAKE}wake_status`)).toHaveLength(1)
+  const sentToFake = JSON.stringify([...r.calls, ...r.wakes].filter(c => c.tool.startsWith(FAKE)).map(c => c.args))
+  expect(sentToFake).not.toContain('tokens')
+  expect(sentToFake).not.toContain('compaction')
+  expect(r.statuses.some(s => s.includes("that connector is not this session's Dashera"))).toBe(true)
+})
+
+test("a save whose session names a sibling doesn't arm a compaction here", async ($, on) => {
+  const r = await live($, on)
+  await $.prompt.submit({ text: 'compact this session', origin: owner } as never)
+  await $.turn.start({ text: 'compact this session', turnId: 's1' })
+  await $.tool.call({ tool: `${D}checkpoint_work`, session: 'S-0B0B0B', compactAfter: true, operationKey: 'op-s1', expectedVersion: 0 } as never)
+  await $.turn.complete(done('s1'))
+  await r.clock.advance(5_000)
+  expect(r.compacts).toEqual([])
+  expect(resumes(r.calls)).toEqual([
+    expect.objectContaining({ session: 'S-0B0B0B', compaction: expect.objectContaining({ id: COMP, status: 'vetoed' }) }),
+  ])
+  expect(String((resumes(r.calls)[0]!.compaction as Args).detail)).toMatch(/^other_session/)
 })
 
 test('a wake-up or another agent through the other connector still cannot compact', async ($, on) => {
@@ -401,13 +454,13 @@ test('a wake-up or another agent through the other connector still cannot compac
   ] as const) {
     await $.prompt.submit({ text, origin: { kind, name: 'dashera' } } as never)
     await $.turn.start({ text, turnId: `w-${kind}` })
-    await $.tool.call({ tool: `${APP}checkpoint_work`, session: 'S-0A0A0A', compactAfter: true, operationKey: `op-${kind}`, expectedVersion: 0 } as never)
+    await $.tool.call({ tool: `${APP}checkpoint_work`, session: CODE, compactAfter: true, operationKey: `op-${kind}`, expectedVersion: 0 } as never)
     await $.turn.complete(done(`w-${kind}`))
     await r.clock.advance(5_000)
   }
   expect(r.compacts).toEqual([])
   const viaApp = r.calls.filter(c => c.tool === `${APP}resume_work`).map(c => c.args)
-  expect(viaApp.at(-1)).toMatchObject({ session: 'S-0A0A0A', compaction: { id: COMP, status: 'vetoed' } })
+  expect(viaApp.at(-1)).toMatchObject({ session: CODE, compaction: { id: COMP, status: 'vetoed' } })
 })
 
 test("Julian's sentence and a bare 'compact this session' from the owner save first and compact", async ($, on) => {

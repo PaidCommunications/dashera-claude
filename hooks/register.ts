@@ -859,6 +859,14 @@ export const register: Register = on => {
   // connectors the tool list shows, whether a sessionWarning was shown in
   // this conversation, and how to show it (set at session.start).
   let codePrefix: string | null = null
+  // Session memory (0.3.10, A1): the Dashera connectors proven to be this
+  // conversation's own: each answered wake_status with this conversation's
+  // id by giving back this session's code, which only the real Dashera for
+  // this agent can work out. Names and descriptions prove nothing (any MCP
+  // server can copy them), so nothing else is trusted. Cleared when the
+  // conversation goes on under a new id.
+  const verifiedPrefixes = new Set<string>()
+  const refusedPrefixes = new Set<string>()
   let codeConnected = false
   let connectors: ReadonlySet<string> = new Set()
   let sessionWarned = false
@@ -1128,6 +1136,7 @@ export const register: Register = on => {
   let memoryAfterCall: ((e: { tool: string; agentId?: string }, next: unknown, r: unknown) => Promise<unknown>) | null = null
   let memoryAfterTurn: (() => Promise<void>) | null = null
   let compactNow: (() => Promise<void>) | null = null
+  let verifyPrefix: ((prefix: string) => Promise<boolean>) | null = null
   let submitCompactRequest: (() => void) | null = null
   /** The memory work after a turn waits this long, so it runs outside the turn. */
   const MEMORY_AFTER_TURN_MS = 1_000
@@ -1217,6 +1226,24 @@ export const register: Register = on => {
         }
       }
     }
+    // A1: a second connector is trusted once it answers wake_status for
+    // this conversation's id with this session's code. One call by the
+    // plugin, only when the model first saves to compact through it, and
+    // never with the session code, sizes or a report in it.
+    verifyPrefix = async (prefix: string) => {
+      if (verifiedPrefixes.has(prefix)) return true
+      if (refusedPrefixes.has(prefix) || !sessionCode) return false
+      const id = await later($.session.id(), 3_000)
+      if (typeof id !== 'string' || !id) return false
+      const text = await later(callDashera('wake_status', { sessionId: id, instance }, prefix), 12_000)
+      const answer = text === 'timeout' ? null : parse(text ?? undefined)
+      if (answer && sessionCode && safeSessionCode(answer.session?.code) === sessionCode) {
+        verifiedPrefixes.add(prefix)
+        return true
+      }
+      refusedPrefixes.add(prefix)
+      return false
+    }
     const usageOf = async (breakdown = false) => {
       try {
         const u = await later(breakdown ? $.session.usage({ breakdown: 'summary' }) : $.session.usage(), 5000)
@@ -1232,7 +1259,8 @@ export const register: Register = on => {
       via: { prefix?: string; code?: string | null } = {},
     ) => {
       const code = via.code ?? sessionCode
-      if (!code) return
+      // Never to a connector not proven to be this session's Dashera (A1).
+      if (!code || (via.prefix !== undefined && !verifiedPrefixes.has(via.prefix))) return
       for (let i = 0; i < 3; i++) {
         const r = await later(
           callDashera('resume_work', { session: code, compaction: { id, status, ...extra } }, via.prefix),
@@ -1256,6 +1284,7 @@ export const register: Register = on => {
       if (now - lastAdvanceAt < EPOCH_DEDUPE_MS) return
       lastAdvanceAt = now
       const code = c.code ?? sessionCode
+      if (c.prefix !== undefined && !verifiedPrefixes.has(c.prefix)) c = { ...c, prefix: undefined }
       const after = await usageOf(true)
       const tokensAfter = c.tokensAfter ?? after?.context.tokens
       report = {
@@ -1374,10 +1403,15 @@ export const register: Register = on => {
       try {
         const s = splitMcpName(e.tool)
         const origin = (callNext as { origin?: { plugin?: string } }).origin
-        // Any of this conversation's Dashera connectors (0.3.10 review): the
-        // one the poll uses, or another that lists Dashera's check tools.
-        const isDashera = !!s && (s.prefix === codePrefix || connectors.has(s.prefix) || dasheraPrefixes.has(s.prefix))
-        if (!s || !isDashera || origin?.plugin === $.plugin.name) return r
+        if (!s || origin?.plugin === $.plugin.name) return r
+        const args = e as unknown as Record<string, unknown>
+        const isSave = s.tool === 'checkpoint_work' && args.compactAfter === true
+        // Only a verified connector (A1): the poll's, or one proven on its
+        // first save to compact. Anything else is never armed or reported to.
+        if (!verifiedPrefixes.has(s.prefix) && !(isSave && (await verifyPrefix?.(s.prefix)))) {
+          if (isSave) cannotCompact('that connector is not this session\'s Dashera; not compacting')
+          return r
+        }
         const text = (r as { text?: string }).text
         const failed = (r as { isError?: boolean; deny?: string }).isError === true || (r as { deny?: string }).deny !== undefined
         // Dashera's own answers in the new context, by size only.
@@ -1389,11 +1423,13 @@ export const register: Register = on => {
           if (s.tool === 'get_playbook' && report.dashera.playbook === 'unknown') report.dashera.playbook = text.length
           if (s.tool === 'resume_work' && report.dashera.card === 'unknown' && /"delivery"\s*:\s*"full"/.test(text)) report.dashera.card = text.length
         }
-        const args = e as unknown as Record<string, unknown>
-        if (s.tool !== 'checkpoint_work' || args.compactAfter !== true) return r
+        if (!isSave) return r
         const confirmed = failed ? null : parseCheckpointAnswer(text)
-        const savedAs = safeSessionCode(args.session) ?? (s.prefix === codePrefix ? sessionCode : null)
-        const via = { prefix: s.prefix, code: savedAs }
+        // This conversation's own session only (A2): a save under another
+        // session's code (a sibling's) never arms a compaction here.
+        const named = safeSessionCode(args.session)
+        const savedAs = sessionCode && (named === null || named === sessionCode) ? sessionCode : null
+        const via = { prefix: s.prefix, code: named ?? sessionCode }
         if (!confirmed || !confirmed.checkpointId || !confirmed.compactionId || confirmed.compactionStatus !== 'pending') {
           // No confirmation, no compaction, and /dashera-compact's arming
           // ends with it: a later turn (a wake-up's) can't use it.
@@ -1429,8 +1465,17 @@ export const register: Register = on => {
         }
         if (!savedAs) {
           handledCompactions.add(confirmed.compactionId)
-          cannotCompact('could not tell which session saved; not compacting')
-          void reportCompaction(confirmed.compactionId, 'failed', { detail: 'no_session_code' }, via)
+          cannotCompact(
+            named && named !== sessionCode
+              ? `the save named ${named}, not this session; not compacting`
+              : 'could not tell which session saved; not compacting',
+          )
+          void reportCompaction(
+            confirmed.compactionId,
+            'vetoed',
+            { detail: named && named !== sessionCode ? 'other_session: saved under another session code' : 'no_session_code' },
+            via,
+          )
           return r
         }
         pendingCompaction = {
@@ -1790,6 +1835,8 @@ export const register: Register = on => {
           lastSentTitle = null
           sessionCode = null
           codePrefix = null
+          verifiedPrefixes.clear()
+          refusedPrefixes.clear()
           codeConnected = false
         }
         // Resumed in a new process: the id this conversation itself last
@@ -2011,6 +2058,9 @@ export const register: Register = on => {
         // Writes get the code only through the connector that gave it, and
         // only while this conversation is connected and live (0.3.9).
         codePrefix = lastGood ? mcpPrefix(lastGood) : null
+        // This connector just answered for this conversation's id with its
+        // code: it is this session's Dashera (A1).
+        if (codePrefix && sessionCode) verifiedPrefixes.add(codePrefix)
         codeConnected = !!sessionCode && answer.connected !== false && !answer.standingBy
         // Continuity: connected under this id now. Remember it (here and in
         // the plugin's store, per conversation id) so a later id can name it.
