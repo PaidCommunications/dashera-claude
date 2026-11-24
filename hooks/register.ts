@@ -692,6 +692,27 @@ export function wakeTools<T extends { name: string; description: string }>(
   return tools.filter(t => isWakeTool(t.name)).sort((a, b) => rank(a) - rank(b))
 }
 
+/**
+ * Whether the engine's facts about an MCP server (tool.describe's
+ * mcpServer) allow it to be Dashera: a direct HTTP(S) server or a vouched
+ * claude.ai connector whose origin is dashera.com (or a subdomain, or this
+ * computer for a local Dashera). Facts the engine doesn't give (a stdio
+ * server, a proxy that hides its upstream, no origin) can't rule it out:
+ * true, and the poll's session-code check decides.
+ */
+export function isDasheraServer(f: { type: string; origin?: string; connectorId?: string }): boolean {
+  const direct = f.type === 'http' || f.type === 'sse' || f.type === 'ws'
+  const vouched = f.type === 'claudeai-proxy' && !!f.connectorId
+  if (!(direct || vouched) || !f.origin) return true
+  let host: string
+  try {
+    host = new URL(f.origin).hostname.toLowerCase()
+  } catch {
+    return true
+  }
+  return host === 'dashera.com' || host.endsWith('.dashera.com') || host === 'localhost' || host === '127.0.0.1' || host === '[::1]'
+}
+
 /** A stood-down copy asks this often in case the keeper went away (0.3.5). */
 export const STAND_DOWN_RECHECK_MS = 10 * 60_000
 /** The one line a copy that stands down shows (0.3.5). */
@@ -859,14 +880,20 @@ export const register: Register = on => {
   // connectors the tool list shows, whether a sessionWarning was shown in
   // this conversation, and how to show it (set at session.start).
   let codePrefix: string | null = null
-  // Session memory (0.3.10, A1): the Dashera connectors proven to be this
-  // conversation's own: each answered wake_status with this conversation's
-  // id by giving back this session's code, which only the real Dashera for
-  // this agent can work out. Names and descriptions prove nothing (any MCP
-  // server can copy them), so nothing else is trusted. Cleared when the
-  // conversation goes on under a new id.
-  const verifiedPrefixes = new Set<string>()
-  const refusedPrefixes = new Set<string>()
+  // Session memory (0.3.10, A1 round 2): the only connector trusted for
+  // memory work is the poll's own (codePrefix), whose wake_status answered
+  // this conversation's id with its session code. A save through any other
+  // connector is confirmed through that one (resume_work shows the same
+  // compaction, pending, for this session) before it arms, and every report,
+  // new context and pointer goes through it. A proof by the other
+  // connector's own answer can be forged: it saw the code in the save.
+  //
+  // Where the engine says which server a connector is (the tool.describe
+  // event's mcpServer: its transport, origin and vouched claude.ai connector
+  // id), one that names another address than Dashera's is never polled or
+  // trusted. A local (stdio) server has no address in the API, so it is
+  // judged by the poll's code alone.
+  const serverFacts = new Map<string, { type: string; origin?: string; connectorId?: string }>()
   let codeConnected = false
   let connectors: ReadonlySet<string> = new Set()
   let sessionWarned = false
@@ -1102,6 +1129,20 @@ export const register: Register = on => {
     return memoryAfterCall ? ((await memoryAfterCall(e, next, r)) as typeof r) : r
   }).catch(($, e, next) => next(e))
 
+  // What the engine says about each MCP server (tool.describe's mcpServer),
+  // by connector prefix. Recorded only; the description is never changed.
+  on('tool.describe', async ($, e, next) => {
+    const out = await next(e)
+    const p = splitMcpName(e.tool)?.prefix
+    if (p && e.mcpServer) serverFacts.set(p, { ...e.mcpServer })
+    return out
+  }).catch(($, e, next) => next(e))
+  // A connector the engine says is another server than Dashera.
+  const pinnedOut = (prefix: string) => {
+    const f = serverFacts.get(prefix)
+    return !!f && !isDasheraServer(f)
+  }
+
   // ---- Session memory (0.3.10, Dashera Session memory 1) ----
   // See hooks/memory.ts. State: whether the running main-loop turn is the
   // owner's (a prompt the person typed started it), whether the next one
@@ -1136,7 +1177,16 @@ export const register: Register = on => {
   let memoryAfterCall: ((e: { tool: string; agentId?: string }, next: unknown, r: unknown) => Promise<unknown>) | null = null
   let memoryAfterTurn: (() => Promise<void>) | null = null
   let compactNow: (() => Promise<void>) | null = null
-  let verifyPrefix: ((prefix: string) => Promise<boolean>) | null = null
+  // A save through another connector whose confirmation couldn't be read
+  // (a timeout, an empty answer): tried again at the next turn ends.
+  let unconfirmed: {
+    id: string
+    checkpointId: string
+    version: number
+    code: string
+    tries: number
+  } | null = null
+  let confirmSave: ((id: string) => Promise<'yes' | 'no' | 'unknown'>) | null = null
   let submitCompactRequest: (() => void) | null = null
   /** The memory work after a turn waits this long, so it runs outside the turn. */
   const MEMORY_AFTER_TURN_MS = 1_000
@@ -1226,23 +1276,24 @@ export const register: Register = on => {
         }
       }
     }
-    // A1: a second connector is trusted once it answers wake_status for
-    // this conversation's id with this session's code. One call by the
-    // plugin, only when the model first saves to compact through it, and
-    // never with the session code, sizes or a report in it.
-    verifyPrefix = async (prefix: string) => {
-      if (verifiedPrefixes.has(prefix)) return true
-      if (refusedPrefixes.has(prefix) || !sessionCode) return false
-      const id = await later($.session.id(), 3_000)
-      if (typeof id !== 'string' || !id) return false
-      const text = await later(callDashera('wake_status', { sessionId: id, instance }, prefix), 12_000)
-      const answer = text === 'timeout' ? null : parse(text ?? undefined)
-      if (answer && sessionCode && safeSessionCode(answer.session?.code) === sessionCode) {
-        verifiedPrefixes.add(prefix)
-        return true
+    // A1 (round 2): a save through another connector is confirmed through
+    // the poll's proven connector: its resume_work (no newContext, no
+    // confirm) must show the same compaction, still pending, for this
+    // session. 'unknown' when the answer can't be read.
+    confirmSave = async (id: string) => {
+      if (!codePrefix || !sessionCode) return 'unknown'
+      const text = await later(callDashera('resume_work', { session: sessionCode }), 12_000)
+      if (text === 'timeout' || !text) return 'unknown'
+      const fenced = /<dashera_data>\s*([\s\S]*?)\s*<\/dashera_data>/.exec(text)
+      const body = fenced ? fenced[1]! : text
+      let a: { session?: { code?: unknown }; compaction?: { id?: unknown; status?: unknown } }
+      try {
+        a = JSON.parse(body.slice(body.indexOf('{'), body.lastIndexOf('}') + 1)) as typeof a
+      } catch {
+        return 'unknown'
       }
-      refusedPrefixes.add(prefix)
-      return false
+      if (safeSessionCode(a.session?.code) !== sessionCode) return 'no'
+      return a.compaction?.id === id && a.compaction?.status === 'pending' ? 'yes' : 'no'
     }
     const usageOf = async (breakdown = false) => {
       try {
@@ -1259,8 +1310,8 @@ export const register: Register = on => {
       via: { prefix?: string; code?: string | null } = {},
     ) => {
       const code = via.code ?? sessionCode
-      // Never to a connector not proven to be this session's Dashera (A1).
-      if (!code || (via.prefix !== undefined && !verifiedPrefixes.has(via.prefix))) return
+      // Only through the poll's proven connector (A1).
+      if (!code || (via.prefix !== undefined && via.prefix !== codePrefix)) return
       for (let i = 0; i < 3; i++) {
         const r = await later(
           callDashera('resume_work', { session: code, compaction: { id, status, ...extra } }, via.prefix),
@@ -1284,7 +1335,7 @@ export const register: Register = on => {
       if (now - lastAdvanceAt < EPOCH_DEDUPE_MS) return
       lastAdvanceAt = now
       const code = c.code ?? sessionCode
-      if (c.prefix !== undefined && !verifiedPrefixes.has(c.prefix)) c = { ...c, prefix: undefined }
+      if (c.prefix !== undefined && c.prefix !== codePrefix) c = { ...c, prefix: undefined }
       const after = await usageOf(true)
       const tokensAfter = c.tokensAfter ?? after?.context.tokens
       report = {
@@ -1406,16 +1457,18 @@ export const register: Register = on => {
         if (!s || origin?.plugin === $.plugin.name) return r
         const args = e as unknown as Record<string, unknown>
         const isSave = s.tool === 'checkpoint_work' && args.compactAfter === true
-        // Only a verified connector (A1): the poll's, or one proven on its
-        // first save to compact. Anything else is never armed or reported to.
-        if (!verifiedPrefixes.has(s.prefix) && !(isSave && (await verifyPrefix?.(s.prefix)))) {
-          if (isSave) cannotCompact('that connector is not this session\'s Dashera; not compacting')
+        // The poll's proven connector, or (a save only) another one whose
+        // save is then confirmed through it. A connector the engine says is
+        // another server than Dashera is never used.
+        const isPoll = !!codePrefix && s.prefix === codePrefix
+        if (pinnedOut(s.prefix) || (!isPoll && !isSave)) {
+          if (isSave) cannotCompact('that connector is not Dashera; not compacting')
           return r
         }
         const text = (r as { text?: string }).text
         const failed = (r as { isError?: boolean; deny?: string }).isError === true || (r as { deny?: string }).deny !== undefined
         // Dashera's own answers in the new context, by size only.
-        if (report && sampling && !failed && typeof text === 'string') {
+        if (isPoll && report && sampling && !failed && typeof text === 'string') {
           if (s.tool === 'check_in' && report.dashera.playbookAndRules === 'unknown') {
             const owner = /<from_your_owner>[\s\S]*?<\/from_your_owner>/.exec(text)
             report.dashera.playbookAndRules = owner ? owner[0].length : 'unknown'
@@ -1429,7 +1482,11 @@ export const register: Register = on => {
         // session's code (a sibling's) never arms a compaction here.
         const named = safeSessionCode(args.session)
         const savedAs = sessionCode && (named === null || named === sessionCode) ? sessionCode : null
-        const via = { prefix: s.prefix, code: named ?? sessionCode }
+        // Reports only through the poll's proven connector, and only for a save
+        // made through it: another connector's compaction id is unproven.
+        const via = { prefix: codePrefix ?? undefined, code: named ?? sessionCode }
+        const report2 = (id: string, status: string, extra: Record<string, unknown>) =>
+          isPoll ? reportCompaction(id, status, extra, via) : Promise.resolve()
         if (!confirmed || !confirmed.checkpointId || !confirmed.compactionId || confirmed.compactionStatus !== 'pending') {
           // No confirmation, no compaction, and /dashera-compact's arming
           // ends with it: a later turn (a wake-up's) can't use it.
@@ -1446,12 +1503,9 @@ export const register: Register = on => {
         const byOwner = e.agentId === undefined && (ownerTurn || now - commandArmedAt < COMMAND_ARM_MS)
         if (!byOwner) {
           handledCompactions.add(confirmed.compactionId)
-          void reportCompaction(
-            confirmed.compactionId,
-            'vetoed',
-            { detail: e.agentId !== undefined ? 'not_owner: a subagent asked' : 'not_owner: the turn was not started by the owner' },
-            via,
-          )
+          void report2(confirmed.compactionId, 'vetoed', {
+            detail: e.agentId !== undefined ? 'not_owner: a subagent asked' : 'not_owner: the turn was not started by the owner',
+          })
           return r
         }
         // The repeat's no-op answer names a pending one this copy never
@@ -1460,7 +1514,7 @@ export const register: Register = on => {
         if (confirmed.version === null) {
           handledCompactions.add(confirmed.compactionId)
           cannotCompact('an earlier compaction never ran; it is cleared, ask again')
-          void reportCompaction(confirmed.compactionId, 'failed', { detail: 'never_armed' }, via)
+          void report2(confirmed.compactionId, 'failed', { detail: 'never_armed' })
           return r
         }
         if (!savedAs) {
@@ -1470,23 +1524,28 @@ export const register: Register = on => {
               ? `the save named ${named}, not this session; not compacting`
               : 'could not tell which session saved; not compacting',
           )
-          void reportCompaction(
-            confirmed.compactionId,
-            'vetoed',
-            { detail: named && named !== sessionCode ? 'other_session: saved under another session code' : 'no_session_code' },
-            via,
-          )
+          void report2(confirmed.compactionId, 'vetoed', {
+            detail: named && named !== sessionCode ? 'other_session: saved under another session code' : 'no_session_code',
+          })
           return r
         }
-        pendingCompaction = {
-          id: confirmed.compactionId,
-          checkpointId: confirmed.checkpointId,
-          version: confirmed.version,
-          tries: 0,
-          prefix: s.prefix,
-          code: savedAs,
-        }
         commandArmedAt = Number.NEGATIVE_INFINITY
+        const candidate = { id: confirmed.compactionId, checkpointId: confirmed.checkpointId, version: confirmed.version, code: savedAs }
+        if (!isPoll) {
+          // Confirmed through the proven connector before it arms (A1).
+          const seen = (await confirmSave?.(candidate.id)) ?? 'unknown'
+          if (seen === 'no') {
+            handledCompactions.add(candidate.id)
+            cannotCompact('that save is not in this session\'s Dashera; not compacting')
+            return r
+          }
+          if (seen === 'unknown') {
+            unconfirmed = { ...candidate, tries: 1 }
+            cannotCompact("couldn't check that save with Dashera yet; trying again")
+            return r
+          }
+        }
+        pendingCompaction = { ...candidate, tries: 0, prefix: codePrefix! }
       } catch {
         // Never in the way of the call's own result.
       }
@@ -1495,6 +1554,24 @@ export const register: Register = on => {
     memoryAfterTurn = async () => {
       if (running.size > 0) return
       try {
+        // A save through another connector not confirmed yet (A1, low 3):
+        // asked again here, up to COMPACT_TRIES times.
+        if (unconfirmed && !pendingCompaction) {
+          const u = unconfirmed
+          const seen = (await confirmSave?.(u.id)) ?? 'unknown'
+          if (seen === 'yes') {
+            unconfirmed = null
+            pendingCompaction = { id: u.id, checkpointId: u.checkpointId, version: u.version, code: u.code, tries: 0, prefix: codePrefix! }
+            contextNote = null
+            sayAgain?.()
+          } else if (seen === 'no' || u.tries + 1 >= COMPACT_TRIES) {
+            unconfirmed = null
+            handledCompactions.add(u.id)
+            cannotCompact(seen === 'no' ? "that save is not in this session's Dashera; not compacting" : "couldn't check that save with Dashera; not compacting, ask again")
+          } else {
+            u.tries += 1
+          }
+        }
         if (pendingCompaction) {
           await compactNow?.()
           return
@@ -1835,8 +1912,7 @@ export const register: Register = on => {
           lastSentTitle = null
           sessionCode = null
           codePrefix = null
-          verifiedPrefixes.clear()
-          refusedPrefixes.clear()
+          unconfirmed = null
           codeConnected = false
         }
         // Resumed in a new process: the id this conversation itself last
@@ -1866,7 +1942,9 @@ export const register: Register = on => {
           await readTitle()
         }
         const tools = await $.tool.list()
-        const found = wakeTools(tools, lastGood)
+        // A connector the engine says is another server than Dashera is
+        // never polled, whatever its tools are called (A1, item 2).
+        const found = wakeTools(tools, lastGood).filter(t => !pinnedOut(mcpPrefix(t.name) ?? ''))
         // Context size (0.3.10): read only for a Dashera that takes it.
         if (found.some(takesContext) && at - contextReadAt >= CONTEXT_REFRESH_MS) {
           contextReadAt = at
@@ -2058,9 +2136,6 @@ export const register: Register = on => {
         // Writes get the code only through the connector that gave it, and
         // only while this conversation is connected and live (0.3.9).
         codePrefix = lastGood ? mcpPrefix(lastGood) : null
-        // This connector just answered for this conversation's id with its
-        // code: it is this session's Dashera (A1).
-        if (codePrefix && sessionCode) verifiedPrefixes.add(codePrefix)
         codeConnected = !!sessionCode && answer.connected !== false && !answer.standingBy
         // Continuity: connected under this id now. Remember it (here and in
         // the plugin's store, per conversation id) so a later id can name it.

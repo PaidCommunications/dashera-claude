@@ -104,6 +104,8 @@ After any compaction of the conversation (this one, your own `/compact`, or Clau
 
 `/dashera-compact report` prints the last compaction: the size before and right after, the runtime's own categories right after (system prompt, system tools, MCP tools, memory files, skills, messages; "unknown" where the runtime doesn't split them), the size of Dashera's own answers in the new context (characters), and the growth over the next 5 turns.
 
+**Which connector it trusts.** Only the Dashera connector whose regular check answered for this conversation with its own session code. A save through another connector is confirmed through that one first (its `resume_work` must show the same compaction, still pending, for this session); every report, the new context and the pointer go through it, never through the other connector. Where Claude Code says which server a connector is (its transport and address, through the `tool.describe` event), a connector at another address than dashera.com (or this computer) is never checked or trusted, whatever its tools are called. Known limit: a local (stdio) connector has no address in the plugin API, and a claude.ai connector the engine reports only through its proxy has none either; those are judged by the session-code check alone.
+
 When the context reaches 300K tokens or 70% of the window, whichever comes first, and at least 150K above its size right after its last compaction, the status line says so with no turn started: "Context 412K (41%). Say "compact this session" to back up to Dashera and compress." `/dashera-compact` is the shortcut for the same thing. Once per context, then again after 100K more.
 
 ## Filling in `session` on Dashera writes (0.3.9 design)
